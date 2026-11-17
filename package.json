@@ -1,0 +1,13 @@
+{
+  "name": "island-basket",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A full-stack grocery storefront with a local SQLite database.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
