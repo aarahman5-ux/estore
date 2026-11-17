@@ -2,13 +2,16 @@ const $ = selector => document.querySelector(selector);
 const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 const money = amount => `MVR ${(amount / 100).toFixed(2)}`;
 const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"></use></svg>`;
-const categories = [
+const suggestedCategories = [
+  ['Electronics', '📱'], ['Furniture', '🛋️'], ['Household Essentials', '🧹']
+];
+const categoryIcons = new Map([...suggestedCategories,
   ['Fruits & Vegetables', '🍊'], ['Dairy & Eggs', '🥛'], ['Pantry Essentials', '🫙'],
   ['Beverages', '🧃'], ['Bakery', '🥐'], ['Snacks', '🍪']
-];
+].map(([name, emoji]) => [name.toLowerCase(), emoji]));
 let products = [];
 let cart = {};
-let category = 'All';
+let category = '';
 let query = '';
 let toastTimer;
 try {
@@ -57,15 +60,21 @@ function productCard(product) {
     </div></article>`;
 }
 function renderCategories() {
-  $('#category-grid').innerHTML = categories.map(([name, emoji]) => {
-    const count = products.filter(product => product.category === name).length;
-    return `<button class="category-card" data-category="${escapeHTML(name)}"><span class="category-image">${emoji}</span><strong>${escapeHTML(name)}</strong><small>${count} ${count === 1 ? 'product' : 'products'}</small></button>`;
+  const categories = new Map(suggestedCategories.map(([name]) => [name.toLowerCase(), name]));
+  for (const product of products) {
+    const key = product.category.toLowerCase();
+    if (!categories.has(key)) categories.set(key, product.category);
+  }
+  const names = [...categories.values()];
+  $('#category-grid').innerHTML = names.map(name => {
+    const count = products.filter(product => product.category.toLowerCase() === name.toLowerCase()).length;
+    return `<button class="category-card" data-category="${escapeHTML(name)}"><span class="category-image">${categoryIcons.get(name.toLowerCase()) || '🛍️'}</span><strong>${escapeHTML(name)}</strong><small>${count ? `${count} ${count === 1 ? 'product' : 'products'}` : 'No products yet'}</small></button>`;
   }).join('');
-  const names = ['All', ...new Set(products.map(product => product.category))];
-  $('#filter-row').innerHTML = names.map(name => `<button class="filter-button ${name === category ? 'active' : ''}" data-category="${escapeHTML(name)}">${escapeHTML(name === 'All' ? 'All products' : name)}</button>`).join('');
+  $('#filter-row').innerHTML = `<button class="filter-button ${!category ? 'active' : ''}" data-category="">All products</button>` +
+    names.map(name => `<button class="filter-button ${name.toLowerCase() === category.toLowerCase() ? 'active' : ''}" data-category="${escapeHTML(name)}">${escapeHTML(name)}</button>`).join('');
 }
 function renderProducts() {
-  let visible = products.filter(product => (category === 'All' || product.category === category) && `${product.name} ${product.category} ${product.description}`.toLowerCase().includes(query));
+  let visible = products.filter(product => (!category || product.category.toLowerCase() === category.toLowerCase()) && `${product.name} ${product.category} ${product.description}`.toLowerCase().includes(query));
   const sort = $('#sort').value;
   if (sort === 'price-low') visible.sort((a, b) => a.price - b.price);
   else if (sort === 'price-high') visible.sort((a, b) => b.price - a.price);
@@ -73,7 +82,7 @@ function renderProducts() {
   else visible.sort((a, b) => b.featured - a.featured || a.id - b.id);
   $('#products-grid').innerHTML = visible.map(productCard).join('');
   $('#empty-products').classList.toggle('hidden', visible.length > 0);
-  $('#results-label').textContent = query || category !== 'All' ? `${visible.length} ${visible.length === 1 ? 'product' : 'products'} found.` : 'A little something for everyone.';
+  $('#results-label').textContent = query || category ? `${visible.length} ${visible.length === 1 ? 'product' : 'products'} found.` : 'A little something for everyone.';
   $('#offers-grid').innerHTML = products.filter(product => product.original_price && product.stock > 0).slice(0, 4).map(productCard).join('');
 }
 function renderCart() {
@@ -128,7 +137,10 @@ document.addEventListener('click', event => {
   if (!target) return;
   if (target.dataset.add) add(Number(target.dataset.add));
   if (target.dataset.detail) showDetail(Number(target.dataset.detail));
-  if (target.dataset.category) setCategory(target.dataset.category);
+  if (Object.hasOwn(target.dataset, 'category')) {
+    if (target.classList.contains('category-card')) { query = ''; $('#search').value = ''; }
+    setCategory(target.dataset.category);
+  }
   if (target.dataset.decrease) {
     const id = target.dataset.decrease;
     if (--cart[id] <= 0) delete cart[id];
@@ -136,8 +148,8 @@ document.addEventListener('click', event => {
   }
   if (target.dataset.remove) { delete cart[target.dataset.remove]; saveCart(); renderCart(); }
 });
-$('#all-categories').addEventListener('click', () => { category = 'All'; renderCategories(); renderProducts(); });
-$('#search-form').addEventListener('submit', event => { event.preventDefault(); query = $('#search').value.trim().toLowerCase(); category = 'All'; renderCategories(); renderProducts(); $('#shop').scrollIntoView({ behavior: 'smooth' }); });
+$('#all-categories').addEventListener('click', () => { category = ''; query = ''; $('#search').value = ''; renderCategories(); renderProducts(); });
+$('#search-form').addEventListener('submit', event => { event.preventDefault(); query = $('#search').value.trim().toLowerCase(); category = ''; renderCategories(); renderProducts(); $('#shop').scrollIntoView({ behavior: 'smooth' }); });
 $('#search').addEventListener('input', event => { query = event.target.value.trim().toLowerCase(); renderProducts(); });
 $('#sort').addEventListener('change', renderProducts);
 $('#cart-open').addEventListener('click', openCart);

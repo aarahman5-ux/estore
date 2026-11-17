@@ -4,7 +4,8 @@
   "private": true,
   "description": "A full-stack grocery storefront with a local SQLite database.",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
     "test": "node --test"
   },
   "engines": {

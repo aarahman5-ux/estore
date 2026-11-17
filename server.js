@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { migrate, newPassword, passwordHash } = require('./lib/database');
+const { createBackupManager } = require('./lib/backups');
 
 const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || '127.0.0.1';
@@ -14,6 +16,7 @@ const db = new DatabaseSync(databasePath);
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
+  PRAGMA busy_timeout = 5000;
   CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -81,7 +84,10 @@ if (db.prepare('SELECT COUNT(*) AS count FROM products').get().count === 0) {
   }
 }
 
-const sessions = new Map();
+migrate(db, adminPassword);
+const backups = createBackupManager(db, process.env.BACKUP_DIR || path.join(path.dirname(databasePath), 'backups'));
+backups.start();
+
 const loginAttempts = new Map();
 const json = (res, status, value) => {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
@@ -113,11 +119,39 @@ function sameOrigin(req) {
 }
 function authorized(req) {
   const token = (req.headers.cookie || '').split('; ').find(part => part.startsWith('admin_session='))?.slice(14);
-  const expiry = sessions.get(token);
-  if (!expiry || expiry < Date.now()) {
-    if (token) sessions.delete(token);
-    throw fail(401, 'Please sign in as an administrator.');
-  }
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) throw fail(401, 'Please sign in.');
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  const user = db.prepare(`SELECT u.id, u.username, u.role FROM staff_sessions s
+    JOIN staff_users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1`).get(hash, Date.now());
+  if (!user) throw fail(401, 'Please sign in.');
+  return { ...user, sessionHash: hash };
+}
+function requireAdmin(user) {
+  if (user.role !== 'admin') throw fail(403, 'Administrator access is required.');
+}
+function username(value) {
+  if (typeof value !== 'string' || !/^[a-zA-Z0-9_.-]{3,32}$/.test(value)) throw fail(400, 'Username must be 3–32 letters, numbers, dots, underscores or hyphens.');
+  return value;
+}
+function verifyPassword(password, user) {
+  const salt = user?.password_salt || '00000000000000000000000000000000';
+  const expected = Buffer.from(user?.password_hash || '0'.repeat(128), 'hex');
+  const actual = Buffer.from(passwordHash(password, salt), 'hex');
+  return crypto.timingSafeEqual(expected, actual) && Boolean(user);
+}
+function paging(url) {
+  const parse = (name, fallback, max) => {
+    const raw = url.searchParams.get(name);
+    if (raw === null) return fallback;
+    if (!/^\d+$/.test(raw)) throw fail(400, `Invalid ${name}.`);
+    return integer(Number(raw), name, name === 'limit' ? 1 : 0, max);
+  };
+  return { limit: parse('limit', 25, 100), offset: parse('offset', 0, 1000000) };
+}
+function searchTerm(url) {
+  const value = (url.searchParams.get('q') || '').trim();
+  if (value.length > 100) throw fail(400, 'Search must be at most 100 characters.');
+  return `%${value.replace(/[\\%_]/g, '\\$&')}%`;
 }
 function productInput(input) {
   const price = integer(input.price, 'price', 0, 100000000);
@@ -164,8 +198,9 @@ async function api(req, res, url) {
       }
       if (total !== expectedTotal) throw fail(409, 'Prices have changed. Please review your updated basket before ordering.');
       const order = db.prepare('INSERT INTO orders (customer_name, phone, address, notes, total) VALUES (?, ?, ?, ?, ?)').run(name, phone, address, (input.notes || '').trim(), total);
+      db.prepare('INSERT INTO order_history (order_id, status, actor) VALUES (?, ?, ?)').run(order.lastInsertRowid, 'pending', 'Customer');
       const addItem = db.prepare('INSERT INTO order_items (order_id, product_id, name, unit_price, quantity) VALUES (?, ?, ?, ?, ?)');
-      const reduceStock = db.prepare('UPDATE products SET stock = stock - ? WHERE id = ?');
+      const reduceStock = db.prepare('UPDATE products SET stock = stock - ?, version = version + 1 WHERE id = ?');
       for (const { product, quantity } of items) {
         addItem.run(order.lastInsertRowid, product.id, product.name, product.price, quantity);
         reduceStock.run(quantity, product.id);
@@ -178,34 +213,140 @@ async function api(req, res, url) {
     }
   }
   if (req.method === 'POST' && pathname === '/api/admin/login') {
-    if (!adminPassword) throw fail(503, 'Admin access is not configured. Set ADMIN_PASSWORD before starting the server.');
+    if (db.prepare('SELECT COUNT(*) AS count FROM staff_users').get().count === 0) throw fail(503, 'Admin access is not configured. Set ADMIN_PASSWORD before starting the server.');
     const key = req.socket.remoteAddress;
     const attempt = loginAttempts.get(key);
     if (attempt && attempt.until > Date.now() && attempt.count >= 5) throw fail(429, 'Too many attempts. Try again in 15 minutes.');
     const input = await body(req);
-    const supplied = typeof input.password === 'string' ? input.password : '';
-    const expectedHash = crypto.createHash('sha256').update(adminPassword).digest();
-    const suppliedHash = crypto.createHash('sha256').update(supplied).digest();
-    if (!crypto.timingSafeEqual(expectedHash, suppliedHash)) {
+    const supplied = typeof input.password === 'string' && input.password.length <= 256 ? input.password : '';
+    const loginName = typeof input.username === 'string' && input.username.length <= 32 ? input.username : 'admin';
+    const user = db.prepare('SELECT * FROM staff_users WHERE username=? COLLATE NOCASE AND active=1').get(loginName);
+    if (!verifyPassword(supplied, user)) {
       const current = attempt && attempt.until > Date.now() ? attempt : { count: 0, until: Date.now() + 15 * 60 * 1000 };
       current.count++;
       loginAttempts.set(key, current);
-      throw fail(401, 'Incorrect password.');
+      throw fail(401, 'Incorrect username or password.');
     }
     loginAttempts.delete(key);
     const token = crypto.randomBytes(32).toString('hex');
-    sessions.set(token, Date.now() + 8 * 60 * 60 * 1000);
+    db.prepare('DELETE FROM staff_sessions WHERE expires_at<=?').run(Date.now());
+    db.prepare('INSERT INTO staff_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+      .run(crypto.createHash('sha256').update(token).digest('hex'), user.id, Date.now() + 8 * 60 * 60 * 1000);
     const secure = process.env.COOKIE_SECURE === 'true' ? '; Secure' : '';
     res.setHeader('Set-Cookie', `admin_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`);
     return json(res, 200, { ok: true });
   }
   if (pathname.startsWith('/api/admin/')) {
-    authorized(req);
+    const user = authorized(req);
     if (req.method === 'POST' && pathname === '/api/admin/logout') {
-      const token = (req.headers.cookie || '').split('; ').find(part => part.startsWith('admin_session='))?.slice(14);
-      sessions.delete(token);
+      db.prepare('DELETE FROM staff_sessions WHERE token_hash=?').run(user.sessionHash);
       res.setHeader('Set-Cookie', 'admin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
       return json(res, 200, { ok: true });
+    }
+    if (req.method === 'GET' && pathname === '/api/admin/me') {
+      return json(res, 200, { id: user.id, username: user.username, role: user.role });
+    }
+    if (req.method === 'POST' && pathname === '/api/admin/password') {
+      const input = await body(req);
+      const current = db.prepare('SELECT * FROM staff_users WHERE id=?').get(user.id);
+      if (typeof input.current_password !== 'string' || input.current_password.length > 256 || !verifyPassword(input.current_password, current)) throw fail(400, 'Current password is incorrect.');
+      const password = newPassword(input.new_password);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('UPDATE staff_users SET password_hash=?, password_salt=? WHERE id=?').run(password.hash, password.salt, user.id);
+        db.prepare('DELETE FROM staff_sessions WHERE user_id=?').run(user.id);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      res.setHeader('Set-Cookie', 'admin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+      return json(res, 200, { ok: true });
+    }
+    if (pathname === '/api/admin/staff' && req.method === 'GET') {
+      requireAdmin(user);
+      return json(res, 200, db.prepare('SELECT id, username, role, active, created_at FROM staff_users ORDER BY username').all());
+    }
+    if (pathname === '/api/admin/staff' && req.method === 'POST') {
+      requireAdmin(user);
+      const input = await body(req);
+      const name = username(input.username);
+      if (!['admin', 'staff'].includes(input.role)) throw fail(400, 'Invalid staff role.');
+      const password = newPassword(input.password);
+      if (db.prepare('SELECT id FROM staff_users WHERE username=? COLLATE NOCASE').get(name)) throw fail(409, 'That username is already in use.');
+      const result = db.prepare('INSERT INTO staff_users (username, password_hash, password_salt, role) VALUES (?, ?, ?, ?)').run(name, password.hash, password.salt, input.role);
+      return json(res, 201, { id: Number(result.lastInsertRowid) });
+    }
+    const staffMatch = pathname.match(/^\/api\/admin\/staff\/(\d+)$/);
+    if (staffMatch && req.method === 'PATCH') {
+      requireAdmin(user);
+      const input = await body(req);
+      const target = db.prepare('SELECT id, role, active FROM staff_users WHERE id=?').get(Number(staffMatch[1]));
+      if (!target) throw fail(404, 'Staff member not found.');
+      if (target.id === user.id) throw fail(400, 'Use Change password for your own account.');
+      if (Object.keys(input).length !== 1 || (!Object.hasOwn(input, 'active') && !Object.hasOwn(input, 'password'))) throw fail(400, 'Provide one staff update.');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (Object.hasOwn(input, 'active')) {
+          if (typeof input.active !== 'boolean') throw fail(400, 'Invalid account status.');
+          if (!input.active && target.role === 'admin' && target.active && db.prepare("SELECT COUNT(*) AS count FROM staff_users WHERE role='admin' AND active=1").get().count <= 1) throw fail(409, 'At least one administrator must remain active.');
+          db.prepare('UPDATE staff_users SET active=? WHERE id=?').run(input.active ? 1 : 0, target.id);
+        } else {
+          const password = newPassword(input.password);
+          db.prepare('UPDATE staff_users SET password_hash=?, password_salt=? WHERE id=?').run(password.hash, password.salt, target.id);
+        }
+        db.prepare('DELETE FROM staff_sessions WHERE user_id=?').run(target.id);
+        db.exec('COMMIT');
+        return json(res, 200, { ok: true });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    }
+    if (pathname === '/api/admin/backups' && req.method === 'GET') {
+      requireAdmin(user);
+      return json(res, 200, backups.status());
+    }
+    if (pathname === '/api/admin/backups' && req.method === 'POST') {
+      requireAdmin(user);
+      return json(res, 201, { filename: await backups.create('manual') });
+    }
+    if (pathname === '/api/admin/overview' && req.method === 'GET') {
+      const orders = db.prepare(`SELECT
+        SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status IN ('confirmed','preparing','out for delivery') THEN 1 ELSE 0 END) AS in_progress,
+        SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+        SUM(CASE WHEN status='delivered' THEN total ELSE 0 END) AS delivered_subtotal
+        FROM orders`).get();
+      const low = db.prepare('SELECT COUNT(*) AS count FROM products WHERE stock<=5').get().count;
+      const recent = db.prepare('SELECT id, customer_name, status, total, created_at FROM orders ORDER BY id DESC LIMIT 5').all();
+      return json(res, 200, { pending: orders.pending || 0, in_progress: orders.in_progress || 0, delivered: orders.delivered || 0, delivered_subtotal: orders.delivered_subtotal || 0, low_stock: low, recent });
+    }
+    if (pathname === '/api/admin/order-search' && req.method === 'GET') {
+      const { limit, offset } = paging(url);
+      const term = searchTerm(url);
+      const status = url.searchParams.get('status') || '';
+      if (status && !['pending', 'confirmed', 'preparing', 'out for delivery', 'delivered', 'cancelled'].includes(status)) throw fail(400, 'Invalid order status.');
+      const where = "WHERE (CAST(id AS TEXT) LIKE ? ESCAPE '\\' OR customer_name LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\') AND (?='' OR status=?)";
+      const params = [term, term, term, status, status];
+      const total = db.prepare(`SELECT COUNT(*) AS count FROM orders ${where}`).get(...params).count;
+      const items = db.prepare(`SELECT id, customer_name, phone, status, total, created_at FROM orders ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      return json(res, 200, { items, total, limit, offset });
+    }
+    if (pathname === '/api/admin/product-search' && req.method === 'GET') {
+      const { limit, offset } = paging(url);
+      const term = searchTerm(url);
+      const category = url.searchParams.get('category') || '';
+      const stock = url.searchParams.get('stock') || '';
+      if (category.length > 80 || !['', 'low', 'out', 'available'].includes(stock)) throw fail(400, 'Invalid product filter.');
+      const where = "WHERE (name LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\') AND (?='' OR category=?) AND (?='' OR (?='low' AND stock<=5) OR (?='out' AND stock=0) OR (?='available' AND stock>0))";
+      const params = [term, term, category, category, stock, stock, stock, stock];
+      const total = db.prepare(`SELECT COUNT(*) AS count FROM products ${where}`).get(...params).count;
+      const items = db.prepare(`SELECT * FROM products ${where} ORDER BY name COLLATE NOCASE, id LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      const categories = db.prepare('SELECT DISTINCT category FROM products ORDER BY category COLLATE NOCASE').all().map(row => row.category);
+      return json(res, 200, { items, total, categories, limit, offset });
+    }
+    const detailMatch = pathname.match(/^\/api\/admin\/orders\/(\d+)$/);
+    if (req.method === 'GET' && detailMatch) {
+      const order = db.prepare('SELECT * FROM orders WHERE id=?').get(Number(detailMatch[1]));
+      if (!order) throw fail(404, 'Order not found.');
+      const items = db.prepare('SELECT name, unit_price, quantity FROM order_items WHERE order_id=?').all(order.id);
+      const history = db.prepare('SELECT status, actor, created_at FROM order_history WHERE order_id=? ORDER BY id DESC').all(order.id);
+      return json(res, 200, { ...order, items, history });
     }
     if (req.method === 'GET' && pathname === '/api/admin/orders') {
       const orders = db.prepare('SELECT * FROM orders ORDER BY id DESC').all();
@@ -219,9 +360,14 @@ async function api(req, res, url) {
     }
     const productMatch = pathname.match(/^\/api\/admin\/products\/(\d+)$/);
     if (req.method === 'PUT' && productMatch) {
-      const values = productInput(await body(req));
-      const result = db.prepare('UPDATE products SET name=?, category=?, description=?, unit=?, price=?, original_price=?, stock=?, image=?, featured=? WHERE id=?').run(...values, Number(productMatch[1]));
-      if (!result.changes) throw fail(404, 'Product not found.');
+      const input = await body(req);
+      const values = productInput(input);
+      const version = integer(input.version, 'product version', 0, Number.MAX_SAFE_INTEGER);
+      const result = db.prepare('UPDATE products SET name=?, category=?, description=?, unit=?, price=?, original_price=?, stock=?, image=?, featured=?, version=version+1 WHERE id=? AND version=?').run(...values, Number(productMatch[1]), version);
+      if (!result.changes) {
+        if (!db.prepare('SELECT id FROM products WHERE id=?').get(Number(productMatch[1]))) throw fail(404, 'Product not found.');
+        throw fail(409, 'This product changed since you opened it. Close the form, refresh the product list, and try again.');
+      }
       return json(res, 200, { ok: true });
     }
     const orderMatch = pathname.match(/^\/api\/admin\/orders\/(\d+)$/);
@@ -235,10 +381,11 @@ async function api(req, res, url) {
         if (order.status === 'cancelled' && input.status !== 'cancelled') throw fail(409, 'Cancelled orders cannot be reopened. Create a new order instead.');
         if (order.status !== 'cancelled' && input.status === 'cancelled') {
           const items = db.prepare('SELECT product_id, quantity FROM order_items WHERE order_id=?').all(Number(orderMatch[1]));
-          const restore = db.prepare('UPDATE products SET stock=stock+? WHERE id=?');
+          const restore = db.prepare('UPDATE products SET stock=stock+?, version=version+1 WHERE id=?');
           for (const item of items) restore.run(item.quantity, item.product_id);
         }
         db.prepare('UPDATE orders SET status=? WHERE id=?').run(input.status, Number(orderMatch[1]));
+        if (order.status !== input.status) db.prepare('INSERT INTO order_history (order_id, status, actor) VALUES (?, ?, ?)').run(Number(orderMatch[1]), input.status, user.username);
         db.exec('COMMIT');
         return json(res, 200, { ok: true });
       } catch (error) {
@@ -277,5 +424,5 @@ http.createServer(async (req, res) => {
   }
 }).listen(port, host, () => {
   console.log(`Island Basket is running at http://${host}:${port}`);
-  if (!adminPassword) console.warn('ADMIN_PASSWORD is not set; admin access is disabled.');
+  if (!db.prepare('SELECT COUNT(*) AS count FROM staff_users').get().count) console.warn('No staff accounts exist. Set ADMIN_PASSWORD and restart to create the initial admin account.');
 });
