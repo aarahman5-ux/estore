@@ -3,6 +3,7 @@ const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&
 const money = amount => `MVR ${(amount / 100).toFixed(2)}`;
 const statuses = ['pending', 'confirmed', 'preparing', 'out for delivery', 'delivered', 'cancelled'];
 const state = { user: null, products: [], staff: [], orderOffset: 0, productOffset: 0, orderTotal: 0, productTotal: 0, orderRequest: 0, productRequest: 0 };
+state.operationsModule = 'returns';
 const pageSize = 25;
 
 async function request(url, options = {}) {
@@ -33,15 +34,33 @@ function statusBadge(status) {
   return `<span class="status-badge status-${escapeHTML(status.replaceAll(' ', '-'))}">${escapeHTML(status)}</span>`;
 }
 function orderRow(order) {
-  return `<div class="order-row"><div class="order-number"><strong>#${order.id}</strong><small>${escapeHTML(dateTime(order.created_at))}</small></div><div class="order-customer"><strong>${escapeHTML(order.customer_name)}</strong><small>${order.phone ? escapeHTML(order.phone) : ''}</small></div>${statusBadge(order.status)}<strong class="row-total">${money(order.total)}</strong><button class="row-action" data-order="${order.id}">View →</button></div>`;
+  const payment = order.payment_status && order.payment_status !== 'legacy' ? ` · Payment ${order.payment_status.replaceAll('_', ' ')}` : '';
+  return `<div class="order-row"><div class="order-number"><strong>#${order.id}</strong><small>${escapeHTML(dateTime(order.created_at))}</small></div><div class="order-customer"><strong>${escapeHTML(order.customer_name)}</strong><small>${order.phone ? escapeHTML(order.phone) : ''}${escapeHTML(payment)}</small></div>${statusBadge(order.status)}<strong class="row-total">${money(order.total)}</strong><button class="row-action" data-order="${order.id}">View →</button></div>`;
+}
+function activityChart(days) {
+  const maximum = Math.max(1, ...days.map(day => day.count));
+  const description = days.map(day => `${day.day}: ${day.count} ${day.count === 1 ? 'order' : 'orders'}`).join(', ');
+  const bars = days.map((day, index) => {
+    const height = Math.round(day.count / maximum * 120);
+    const x = 33 + index * 87;
+    const label = new Date(`${day.day}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    return `<rect class="activity-bar" x="${x}" y="${155 - height}" width="38" height="${height}" rx="5"></rect><text class="activity-count" x="${x + 19}" y="${Math.max(18, 147 - height)}" text-anchor="middle">${day.count}</text><text class="activity-date" x="${x + 19}" y="183" text-anchor="middle">${escapeHTML(label)}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 640 200" role="img" aria-label="Orders placed by day, UTC. ${escapeHTML(description)}"><line class="activity-grid-line" x1="20" y1="35" x2="620" y2="35"></line><line class="activity-grid-line" x1="20" y1="95" x2="620" y2="95"></line><line class="activity-grid-line" x1="20" y1="155" x2="620" y2="155"></line>${bars}</svg>`;
 }
 async function loadOverview() {
   const data = await request('/api/admin/overview');
   $('#metric-pending').textContent = data.pending;
   $('#metric-progress').textContent = data.in_progress;
   $('#metric-delivered').textContent = data.delivered;
-  $('#metric-subtotal').textContent = `${money(data.delivered_subtotal)} order subtotal`;
+  $('#metric-subtotal').textContent = `${money(data.delivered_subtotal)} subtotal · not payments`;
   $('#metric-low').textContent = data.low_stock;
+  $('#metric-today').textContent = data.today_orders;
+  $('#metric-catalog').textContent = data.catalog_products;
+  $('#activity-total').textContent = data.activity.reduce((total, day) => total + day.count, 0);
+  $('#activity-chart').innerHTML = activityChart(data.activity);
+  $('#low-stock-list').innerHTML = data.low_stock_items.length ? data.low_stock_items.map(product => `<div class="overview-product"><img src="${escapeHTML(product.image)}" alt=""><div><strong>${escapeHTML(product.name)}</strong><small>${escapeHTML(product.category)}</small></div><span class="stock-alert">${product.stock === 0 ? 'Out of stock' : `${product.stock} left`}</span></div>`).join('') : '<p class="empty-admin">No products are low on stock.</p>';
+  $('#top-products').innerHTML = data.top_products.length ? data.top_products.map(product => `<div class="overview-product"><img src="${escapeHTML(product.image)}" alt=""><div><strong>${escapeHTML(product.name)}</strong><small>Non-cancelled orders</small></div><span class="units-sold">${product.quantity} ordered</span></div>`).join('') : '<p class="empty-admin">No products ordered yet.</p>';
   $('#recent-orders').innerHTML = data.recent.length ? data.recent.map(orderRow).join('') : '<p class="empty-admin">No orders yet. New orders will appear here.</p>';
 }
 function pagination(type, offset, total) {
@@ -68,7 +87,7 @@ async function loadProducts() {
   const category = $('#product-category-filter').value;
   $('#product-category-filter').innerHTML = `<option value="">All categories</option>${data.categories.map(name => `<option value="${escapeHTML(name)}">${escapeHTML(name)}</option>`).join('')}`;
   $('#product-category-filter').value = category;
-  $('#admin-products').innerHTML = data.items.length ? data.items.map(product => `<div class="admin-item"><img src="${escapeHTML(product.image)}" alt=""><div class="admin-item-info"><strong>${escapeHTML(product.name)}</strong><small>${escapeHTML(product.category)} · ${money(product.price)} · ${escapeHTML(product.unit)}</small></div><span class="${product.stock <= 5 ? 'stock-alert' : 'stock-normal'}">${product.stock === 0 ? 'Out of stock' : `${product.stock} in stock`}</span><button data-edit="${product.id}">Edit</button></div>`).join('') : '<p class="empty-admin">No products match your filters.</p>';
+  $('#admin-products').innerHTML = data.items.length ? data.items.map(product => `<div class="admin-item"><img src="${escapeHTML(product.image)}" alt=""><div class="admin-item-info"><strong>${escapeHTML(product.name)}</strong><small>${escapeHTML(product.category)} · ${money(product.price)} · ${escapeHTML(product.unit)}</small></div><span class="${product.stock <= 5 ? 'stock-alert' : 'stock-normal'}">${product.stock === 0 ? 'Standard out of stock' : `${product.stock} standard stock`}</span><button data-edit="${product.id}">Edit</button></div>`).join('') : '<p class="empty-admin">No products match your filters.</p>';
   pagination('products', state.productOffset, data.total);
 }
 async function loadStaff() {
@@ -80,15 +99,31 @@ async function loadBackups() {
   $('#backup-status').textContent = data.last_error ? `Last backup failed: ${data.last_error}` : data.running ? 'Backup in progress.' : data.last_success ? `Latest verified backup: ${dateTime(data.last_success)}` : 'Automatic backup has not completed yet.';
   $('#backup-status').classList.toggle('form-error', Boolean(data.last_error));
 }
-async function switchPanel(panel) {
-  if (!['overview', 'orders', 'products', 'staff', 'backups'].includes(panel)) return;
-  if (['staff', 'backups'].includes(panel) && state.user.role !== 'admin') return;
+async function loadBank() {
+  const settings = await request('/api/admin/bank-settings');
+  const form = $('#bank-form');
+  for (const name of ['bank_name', 'account_name', 'account_number', 'instructions']) form.elements[name].value = settings?.[name] || '';
+  $('#bank-message').textContent = settings ? '' : 'Bank details have not been configured.';
+  clearError($('#bank-error'));
+}
+async function loadStoreSettings() {
+  const settings=await request('/api/admin/store-settings');
+  const form=$('#store-settings-form');
+  for(const name of ['store_name','page_title','tagline','support_email','phone','address','logo_url','favicon_url']) form.elements[name].value=settings[name]||'';
+  form.dataset.version=settings.version;
+  clearError($('#store-settings-error'));
+}
+async function switchPanel(panel, module = state.operationsModule) {
+  if (!['overview', 'orders', 'products', 'inventory', 'operations', 'bank', 'store-settings', 'staff', 'backups'].includes(panel)) return;
+  if (['bank', 'store-settings', 'staff', 'backups'].includes(panel) && state.user.role !== 'admin') return;
+  if (panel === 'operations' && ['content','inbox'].includes(module) && state.user.role !== 'admin') return;
+  if (panel === 'operations') state.operationsModule = module;
   document.querySelectorAll('.dashboard-panel').forEach(element => element.classList.add('hidden'));
-  document.querySelectorAll('[data-panel]').forEach(element => element.classList.toggle('active', element.dataset.panel === panel));
+  document.querySelectorAll('[data-panel]').forEach(element => element.classList.toggle('active', element.dataset.panel === panel && (panel !== 'operations' || element.dataset.module === module)));
   $(`#${panel}-panel`).classList.remove('hidden');
   clearError($('#admin-error'));
   try {
-    await ({ overview: loadOverview, orders: loadOrders, products: loadProducts, staff: loadStaff, backups: loadBackups })[panel]();
+    await ({ overview: loadOverview, orders: loadOrders, products: loadProducts, inventory: () => window.dispatchEvent(new Event('inventory:open')), operations: () => window.dispatchEvent(new CustomEvent('operations:open', { detail: module })), bank: loadBank, 'store-settings': loadStoreSettings, staff: loadStaff, backups: loadBackups })[panel]();
   } catch (error) { report(error); }
 }
 async function showDashboard() {
@@ -97,10 +132,12 @@ async function showDashboard() {
   document.querySelectorAll('.admin-only').forEach(element => element.classList.toggle('hidden', state.user.role !== 'admin'));
   $('#login-view').classList.add('hidden');
   $('#dashboard').classList.remove('hidden');
+  document.body.classList.add('dashboard-active');
   await switchPanel('overview');
 }
 function showLogin(message) {
   state.user = null;
+  document.body.classList.remove('dashboard-active');
   $('#dashboard').classList.add('hidden');
   $('#login-view').classList.remove('hidden');
   if (message) showError($('#login-error'), new Error(message));
@@ -123,7 +160,7 @@ $('#logout').addEventListener('click', async () => {
   try { await request('/api/admin/logout', { method: 'POST' }); showLogin(); }
   catch (error) { report(error); }
 });
-document.querySelectorAll('[data-panel]').forEach(button => button.addEventListener('click', () => switchPanel(button.dataset.panel)));
+document.querySelectorAll('[data-panel]').forEach(button => button.addEventListener('click', () => switchPanel(button.dataset.panel, button.dataset.module)));
 document.addEventListener('click', async event => {
   const button = event.target.closest('button');
   if (!button) return;
@@ -163,11 +200,37 @@ $('#products-next').addEventListener('click', () => { if (state.productOffset + 
 async function openOrder(id) {
   const order = await request(`/api/admin/orders/${id}`);
   $('#order-title').textContent = `Order #${order.id}`;
-  $('#order-detail').innerHTML = `<div class="order-detail-block"><div class="detail-line"><span>Status</span>${statusBadge(order.status)}</div><div class="detail-line"><span>Placed</span><strong>${escapeHTML(dateTime(order.created_at))}</strong></div><div class="detail-line"><span>Customer</span><strong>${escapeHTML(order.customer_name)}</strong></div><div class="detail-line"><span>Phone</span><strong>${escapeHTML(order.phone)}</strong></div><div class="detail-line"><span>Address</span><strong>${escapeHTML(order.address)}</strong></div>${order.notes ? `<div class="detail-line"><span>Notes</span><strong>${escapeHTML(order.notes)}</strong></div>` : ''}</div><h3>Items</h3>${order.items.map(item => `<div class="detail-line"><span>${item.quantity} × ${escapeHTML(item.name)}</span><strong>${money(item.quantity * item.unit_price)}</strong></div>`).join('')}<div class="detail-line detail-total"><span>Order subtotal</span><strong>${money(order.total)}</strong></div><p class="fine-print">Cash on delivery. Payment and delivery charges are not tracked here.</p><label class="detail-status">Update status<select id="order-status-update" ${order.status === 'cancelled' ? 'disabled' : ''}>${statuses.map(status => `<option value="${status}" ${status === order.status ? 'selected' : ''}>${status}</option>`).join('')}</select></label><p class="form-error hidden" id="order-error" role="alert"></p><h3>Status history</h3><div class="history-list">${order.history.map(item => `<div><strong>${escapeHTML(item.status)}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`;
+  $('#order-detail').innerHTML = `<div class="order-detail-block"><div class="detail-line"><span>Status</span>${statusBadge(order.status)}</div><div class="detail-line"><span>Placed</span><strong>${escapeHTML(dateTime(order.created_at))}</strong></div><div class="detail-line"><span>Customer</span><strong>${escapeHTML(order.customer_name)}</strong></div><div class="detail-line"><span>Phone</span><strong>${escapeHTML(order.phone)}</strong></div><div class="detail-line"><span>Address</span><strong>${escapeHTML(order.address)}</strong></div>${order.notes ? `<div class="detail-line"><span>Notes</span><strong>${escapeHTML(order.notes)}</strong></div>` : ''}</div><h3>Items</h3>${order.items.map(item => `<div class="detail-line"><span>${item.quantity} × ${escapeHTML(item.name)}</span><strong>${money(item.quantity * item.unit_price)}</strong></div>`).join('')}<div class="detail-line detail-total"><span>Order subtotal</span><strong>${money(order.total)}</strong></div><p class="fine-print">Delivery charges are not tracked here.</p><label class="detail-status">Update status<select id="order-status-update" ${order.status === 'cancelled' ? 'disabled' : ''}>${statuses.map(status => `<option value="${status}" ${status === order.status ? 'selected' : ''}>${status}</option>`).join('')}</select></label><p class="form-error hidden" id="order-error" role="alert"></p><h3>Status history</h3><div class="history-list">${order.history.map(item => `<div><strong>${escapeHTML(item.status)}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`;
   const select = $('#order-status-update');
+  const payment = order.payment_status === 'legacy' ? 'Existing order — payment not tracked' : `Bank transfer · ${order.payment_status.replaceAll('_', ' ')}`;
+  $('#order-detail').insertAdjacentHTML('beforeend', `<h3>Payment</h3><p>${escapeHTML(payment)}</p>${order.has_payment_proof ? `<a class="text-link" href="/api/admin/orders/${order.id}/payment-proof">Download payment slip</a>` : ''}${order.payment_status !== 'legacy' && order.status === 'pending' ? '<p class="fine-print">Check the bank account independently before verifying. Rejected orders retain stock until cancelled.</p><div class="dashboard-actions"><button class="filter-button" id="verify-payment">Verify payment</button><button class="filter-button" id="reject-payment">Reject slip</button></div><p class="form-error hidden" id="payment-error" role="alert"></p>' : ''}<div class="history-list">${order.payment_history.map(item => `<div><strong>${escapeHTML(item.status.replaceAll('_', ' '))}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`);
+  for (const [selector, status] of [['#verify-payment', 'verified'], ['#reject-payment', 'rejected']]) {
+    const button = $(selector);
+    if (!button) continue;
+    button.addEventListener('click', async () => {
+      if (!confirm(status === 'verified' ? 'Have you independently confirmed this transfer in the bank account?' : 'Reject this slip? The order remains pending until cancelled.')) return;
+      button.disabled = true;
+      try { await post(`/api/admin/orders/${order.id}/payment`, 'PATCH', { status }); await openOrder(order.id); await loadOrders(); }
+      catch (error) { showError($('#payment-error'), error); button.disabled = false; }
+    });
+  }
+  const shipment = order.shipment;
+  $('#order-detail').insertAdjacentHTML('beforeend', `<h3>Manual shipment tracking</h3><p class="fine-print">For reference only; this does not contact a carrier or update delivery status.</p><form id="shipment-form"><label>Carrier<input name="carrier" maxlength="120" value="${escapeHTML(shipment?.carrier || '')}"></label><label>Tracking number<input name="tracking_number" maxlength="120" value="${escapeHTML(shipment?.tracking_number || '')}"></label><p class="form-error hidden" id="shipment-error" role="alert"></p><button class="button button-dark" type="submit">Save tracking</button>${shipment ? `<p class="fine-print">Last updated by ${escapeHTML(shipment.updated_by)} · ${escapeHTML(dateTime(shipment.updated_at))}</p>` : ''}</form>`);
+  $('#shipment-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector('button');
+    const data = new FormData(form);
+    button.disabled = true;
+    clearError($('#shipment-error'));
+    try {
+      await post(`/api/admin/orders/${order.id}/shipment`, 'PUT', { carrier: data.get('carrier'), tracking_number: data.get('tracking_number'), version: shipment?.version ?? null });
+      await openOrder(order.id);
+    } catch (error) { showError($('#shipment-error'), error); button.disabled = false; }
+  });
   select.addEventListener('change', async () => {
     const next = select.value;
-    if (next === 'cancelled' && !confirm('Cancel this order and restore its stock? Cancelled orders cannot be reopened.')) { select.value = order.status; return; }
+    if (next === 'cancelled' && !confirm('Cancel this order and restore its stock? Cancelled orders cannot be reopened. Any payment or refund must be handled separately; this action does not refund the customer.')) { select.value = order.status; return; }
     select.disabled = true;
     try {
       await post(`/api/admin/orders/${order.id}`, 'PATCH', { status: next });
@@ -264,5 +327,32 @@ $('#backup-now').addEventListener('click', async event => {
     $('#backup-status').textContent = `Backup created: ${result.filename}`;
   } catch (error) { report(error); }
   finally { button.disabled = false; }
+});
+$('#bank-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const button = form.querySelector('button[type=submit]');
+  button.disabled = true;
+  clearError($('#bank-error'));
+  $('#bank-message').textContent = '';
+  try {
+    await post('/api/admin/bank-settings', 'PUT', { bank_name: data.get('bank_name'), account_name: data.get('account_name'), account_number: data.get('account_number'), instructions: data.get('instructions') });
+    $('#bank-message').textContent = 'Bank details saved and visible to customers.';
+  } catch (error) { showError($('#bank-error'), error); }
+  finally { button.disabled = false; }
+});
+$('#store-settings-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const form=event.currentTarget;
+  const data=new FormData(form);
+  const button=form.querySelector('button[type=submit]');
+  button.disabled=true;clearError($('#store-settings-error'));$('#store-settings-message').textContent='';
+  try{
+    await post('/api/admin/store-settings','PUT',{store_name:data.get('store_name'),page_title:data.get('page_title'),tagline:data.get('tagline'),support_email:data.get('support_email'),phone:data.get('phone'),address:data.get('address'),logo_url:data.get('logo_url'),favicon_url:data.get('favicon_url'),version:Number(form.dataset.version)});
+    $('#store-settings-message').textContent='Branding settings saved.';
+    await loadStoreSettings();
+  }catch(error){showError($('#store-settings-error'),error);}
+  finally{button.disabled=false;}
 });
 showDashboard().catch(error => { if (error.status !== 401) showError($('#login-error'), error); });

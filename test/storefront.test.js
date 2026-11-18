@@ -13,7 +13,7 @@ async function storefront(products) {
         innerHTML: '', textContent: '', value: selector === '#sort' ? 'featured' : '',
         classList: { add() {}, remove() {}, toggle() {} },
         addEventListener(name, handler) { this[name] = handler; },
-        scrollIntoView() {}
+        scrollIntoView() {}, showModal() {}, close() {}
       });
     }
     return elements.get(selector);
@@ -53,4 +53,16 @@ test('category cards clear previous search and all-products filter restores the 
   click('', false);
   assert.match(page.element('#products-grid').innerHTML, /Tablet/);
   assert.match(page.element('#products-grid').innerHTML, /Sofa/);
+});
+test('customers can select an in-stock variant when the standard product is sold out', async () => {
+  const item = { ...product(1, 'Lamp', 'Household'), stock: 0, variants: [{ id: 7, name: 'Blue', price: 2500, stock: 2 }] };
+  const page = await storefront([item]);
+  assert.match(page.element('#products-grid').innerHTML, /data-detail="1"/);
+  page.listeners.click({ target: { closest() { return { dataset: { detail: '1' } }; } } });
+  assert.match(page.element('#product-detail').innerHTML, /Blue · MVR 25\.00/);
+  page.element('#detail-variant').value = '7';
+  page.listeners.click({ target: { closest() { return { dataset: { add: '1', selectVariant: 'true' } }; } } });
+  assert.match(page.element('#cart-items').innerHTML, /Blue · MVR 25\.00/);
+  assert.match(page.element('#cart-items').innerHTML, /data-remove="1:7"/);
+  assert.equal(page.element('#cart-total').textContent, 'MVR 25.00');
 });

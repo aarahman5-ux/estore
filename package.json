@@ -2,11 +2,25 @@
   "name": "island-basket",
   "version": "1.0.0",
   "private": true,
-  "description": "A full-stack grocery storefront with a local SQLite database.",
+  "description": "A full-stack general store with a local SQLite database.",
   "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "prestart": "npm run build",
     "start": "node --env-file-if-exists=.env server.js",
+    "predev": "npm run build",
     "dev": "node --env-file-if-exists=.env --watch server.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
   },
   "engines": {
     "node": ">=24"
