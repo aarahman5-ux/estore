@@ -1,4 +1,6 @@
 node_modules/
 public/admin-workspace.js
 data/
+!.github/prompts/ui-ux-pro-max/data/
+!.github/prompts/ui-ux-pro-max/data/**
 .env

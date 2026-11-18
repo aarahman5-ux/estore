@@ -6,6 +6,7 @@ type Product = { id: number; name: string; category: string; stock: number };
 type ProductPage = { items: Product[]; total: number };
 type Variant = { id: number; name: string; price: number; stock: number; version: number };
 type LowVariant = { id: number; name: string; product_name: string; stock: number };
+const formatMoney = (amount: number) => `MVR ${(amount / 100).toFixed(2)}`;
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -135,13 +136,74 @@ function Inventory() {
   </>;
 }
 
+type ContentField = {
+  key: string;
+  label: string;
+  type?: 'text' | 'textarea' | 'number' | 'url' | 'email' | 'datetime-local' | 'select';
+  required?: boolean;
+  maxLength?: number;
+  step?: string;
+  pattern?: string;
+  options?: string[];
+  hint?: string;
+};
+type ContentDefinition = {
+  label: string;
+  description: string;
+  statuses: string[];
+  fields: ContentField[];
+  limitation?: string;
+};
 const contentModules = [
   'pages', 'blog_posts', 'blog_categories', 'faqs', 'navigation', 'popups',
   'testimonials', 'testimonial_categories', 'brands', 'collections', 'attributes',
   'tags', 'reviews', 'coupons', 'promotions', 'gift_cards', 'campaigns',
   'email_templates', 'email_drafts', 'notifications', 'media', 'teams',
   'roles', 'permissions', 'integrations', 'webhooks', 'settings'
+] as const;
+type ContentModule = typeof contentModules[number];
+const contentGroups: { label: string; modules: ContentModule[] }[] = [
+  { label: 'Storefront content', modules: ['pages', 'blog_posts', 'blog_categories', 'faqs', 'navigation', 'popups', 'testimonials', 'testimonial_categories'] },
+  { label: 'Catalog & offers', modules: ['brands', 'collections', 'attributes', 'tags', 'reviews', 'coupons', 'promotions', 'gift_cards', 'campaigns'] },
+  { label: 'Communication', modules: ['email_templates', 'email_drafts', 'notifications'] },
+  { label: 'Workspace administration', modules: ['media', 'teams', 'roles', 'permissions', 'integrations', 'webhooks', 'settings'] }
 ];
+function isContentModule(value: string): value is ContentModule {
+  return contentModules.some(module => module === value);
+}
+const textField = (key: string, label: string, required = false, hint?: string): ContentField => ({ key, label, required, maxLength: 1000, hint });
+const longField = (key: string, label: string, required = false): ContentField => ({ key, label, type: 'textarea', required, maxLength: 5000 });
+const urlField = (key: string, label: string): ContentField => ({ key, label, type: 'url', maxLength: 1000, pattern: 'https://.*', hint: 'Use an HTTPS URL.' });
+const slugField = (): ContentField => ({ key: 'slug', label: 'URL slug', required: true, maxLength: 120, pattern: '[a-z0-9]+(?:-[a-z0-9]+)*', hint: 'Lowercase letters, numbers, and hyphens only.' });
+const contentDefinitions: Record<ContentModule, ContentDefinition> = {
+  pages: { label: 'Pages', description: 'Create public information pages using a unique URL slug.', statuses: ['draft', 'published', 'archived'], fields: [slugField(), longField('body', 'Page content', true)] },
+  blog_posts: { label: 'Blog posts', description: 'Draft and publish articles on the public store.', statuses: ['draft', 'published', 'archived'], fields: [slugField(), textField('author', 'Author'), textField('excerpt', 'Excerpt'), urlField('featured_image', 'Featured image URL'), longField('body', 'Article content', true)] },
+  blog_categories: { label: 'Blog categories', description: 'Organize published articles by category.', statuses: ['active', 'inactive'], fields: [slugField(), longField('description', 'Description'), urlField('image', 'Category image URL')] },
+  faqs: { label: 'FAQs', description: 'Create public answers to common customer questions.', statuses: ['draft', 'published', 'archived'], fields: [slugField(), textField('question', 'Question', true), longField('answer', 'Answer', true)] },
+  navigation: { label: 'Navigation', description: 'Maintain menu link records for your storefront navigation.', statuses: ['active', 'inactive'], fields: [textField('label', 'Link label', true), textField('url', 'Destination URL', true), { key: 'position', label: 'Position', type: 'number', step: '1' }, textField('parent', 'Parent link label')] },
+  popups: { label: 'Popups', description: 'Prepare promotional popup content and its display schedule.', statuses: ['draft', 'active', 'inactive', 'archived'], fields: [textField('headline', 'Headline', true), longField('body', 'Message'), textField('cta_label', 'Button label'), urlField('cta_url', 'Button destination'), urlField('image', 'Image URL'), { key: 'starts_at', label: 'Starts at', type: 'datetime-local' }, { key: 'ends_at', label: 'Ends at', type: 'datetime-local' }], limitation: 'Popup display is not yet connected to the storefront.' },
+  testimonials: { label: 'Testimonials', description: 'Manage customer quote records and optional images.', statuses: ['draft', 'published', 'archived'], fields: [textField('author', 'Customer name', true), longField('quote', 'Testimonial', true), { key: 'rating', label: 'Rating (1–5)', type: 'number', step: '1' }, urlField('image', 'Customer image URL'), textField('category', 'Category')] },
+  testimonial_categories: { label: 'Testimonial categories', description: 'Group testimonials into reusable categories.', statuses: ['active', 'inactive'], fields: [textField('slug', 'Category key', true), longField('description', 'Description')] },
+  brands: { label: 'Brands', description: 'Maintain brand information for your catalogue.', statuses: ['active', 'inactive'], fields: [textField('slug', 'Brand key', true), urlField('logo', 'Logo URL'), urlField('website', 'Website'), longField('description', 'Description')] },
+  collections: { label: 'Collections', description: 'Group catalogue items into named collections.', statuses: ['draft', 'published', 'archived'], fields: [slugField(), longField('description', 'Description'), urlField('image', 'Collection image URL'), textField('product_ids', 'Product IDs', false, 'Comma-separated product IDs.')] },
+  attributes: { label: 'Attributes', description: 'Define product attribute names and their available values.', statuses: ['active', 'inactive'], fields: [textField('attribute', 'Attribute name', true), textField('values', 'Values', true, 'Comma-separated options, such as Small, Medium, Large.')] },
+  tags: { label: 'Tags', description: 'Maintain reusable catalogue labels.', statuses: ['active', 'inactive'], fields: [textField('slug', 'Tag key', true), textField('color', 'Color (optional)', false, 'CSS color name or hex value.')] },
+  reviews: { label: 'Reviews', description: 'Moderate customer review records.', statuses: ['pending', 'published', 'rejected'], fields: [textField('product_id', 'Product ID', true), textField('reviewer', 'Reviewer name', true), { key: 'rating', label: 'Rating (1–5)', type: 'number', step: '1', required: true }, textField('headline', 'Review title'), longField('body', 'Review', true)], limitation: 'Reviews are managed here but are not yet displayed on product pages.' },
+  coupons: { label: 'Coupons', description: 'Configure checkout discounts and redemption limits.', statuses: ['active', 'inactive', 'archived'], fields: [textField('code', 'Coupon code', true), { key: 'discount_type', label: 'Discount type', type: 'select', required: true, options: ['percentage', 'fixed'] }, { key: 'value', label: 'Discount value', type: 'number', step: '1', required: true, hint: 'Whole percent or MVR cents for a fixed discount.' }, { key: 'min_subtotal', label: 'Minimum subtotal (MVR cents)', type: 'number', step: '1' }, { key: 'max_redemptions', label: 'Maximum redemptions', type: 'number', step: '1' }, { key: 'expires_at', label: 'Expires at', type: 'datetime-local' }] },
+  promotions: { label: 'Promotions', description: 'Plan promotions with dates, offer details, and eligibility notes.', statuses: ['draft', 'active', 'inactive', 'archived'], fields: [textField('offer', 'Offer description', true), textField('discount_type', 'Discount type'), { key: 'value', label: 'Offer value', type: 'number', step: '1' }, { key: 'starts_at', label: 'Starts at', type: 'datetime-local' }, { key: 'ends_at', label: 'Ends at', type: 'datetime-local' }, longField('rules', 'Eligibility rules')], limitation: 'Only coupons are currently applied during checkout.' },
+  gift_cards: { label: 'Gift cards', description: 'Record gift card details for staff reference.', statuses: ['draft', 'active', 'redeemed', 'expired', 'cancelled'], fields: [textField('code', 'Gift card code', true), { key: 'initial_value', label: 'Initial value (MVR cents)', type: 'number', step: '1', required: true }, { key: 'balance', label: 'Remaining balance (MVR cents)', type: 'number', step: '1', required: true }, { key: 'expires_at', label: 'Expires at', type: 'datetime-local' }, textField('recipient', 'Recipient')] , limitation: 'Gift cards are records only and are not redeemable at checkout.' },
+  campaigns: { label: 'Campaigns', description: 'Organize campaign content, channel, audience, and budget.', statuses: ['draft', 'active', 'paused', 'completed'], fields: [textField('channel', 'Channel', true), textField('audience', 'Audience'), { key: 'budget', label: 'Budget (MVR cents)', type: 'number', step: '1' }, { key: 'starts_at', label: 'Starts at', type: 'datetime-local' }, { key: 'ends_at', label: 'Ends at', type: 'datetime-local' }, longField('content', 'Campaign content')], limitation: 'Campaigns are not sent or published automatically.' },
+  email_templates: { label: 'Email templates', description: 'Save reusable email subject and body drafts.', statuses: ['draft', 'active', 'inactive'], fields: [textField('subject', 'Subject', true), textField('preheader', 'Preheader'), longField('body', 'Template body', true)], limitation: 'Email delivery requires an email provider, which is not configured.' },
+  email_drafts: { label: 'Email drafts', description: 'Prepare message drafts for staff review.', statuses: ['draft', 'ready', 'archived'], fields: [textField('to', 'Recipient email', true), textField('subject', 'Subject', true), longField('body', 'Message body', true)], limitation: 'Drafts are saved only; this workspace does not send email.' },
+  notifications: { label: 'Notifications', description: 'Maintain notification message templates and event notes.', statuses: ['active', 'inactive'], fields: [textField('event', 'Event key', true), textField('channel', 'Channel', true), textField('subject', 'Subject'), longField('message', 'Message', true)], limitation: 'Notifications are not delivered automatically.' },
+  media: { label: 'Media', description: 'Keep a searchable catalogue of externally hosted media.', statuses: ['active', 'archived'], fields: [urlField('url', 'Media URL'), textField('alt', 'Alternative text'), textField('media_type', 'Media type'), textField('file_name', 'File name')], limitation: 'Files are not uploaded or stored by the app.' },
+  teams: { label: 'Teams', description: 'Maintain team names and staff assignment notes.', statuses: ['active', 'inactive'], fields: [longField('description', 'Team description'), textField('members', 'Members', false, 'Comma-separated staff usernames.')] , limitation: 'Team records do not change staff permissions.' },
+  roles: { label: 'Roles', description: 'Document role names and responsibility notes.', statuses: ['active', 'inactive'], fields: [textField('role_key', 'Role key', true), longField('description', 'Responsibilities'), textField('permissions', 'Permission notes', false, 'Comma-separated permission keys.')] , limitation: 'Access is controlled by the built-in admin and staff roles.' },
+  permissions: { label: 'Permissions', description: 'Document permission keys and descriptions.', statuses: ['active', 'inactive'], fields: [textField('key', 'Permission key', true), longField('description', 'Description')] , limitation: 'Custom permission records are not enforced by authorization.' },
+  integrations: { label: 'Integrations', description: 'Track integration providers and setup status.', statuses: ['inactive', 'active'], fields: [textField('provider', 'Provider', true), textField('account_reference', 'Account reference'), longField('notes', 'Setup notes')], limitation: 'This page tracks configuration notes; it does not connect external services.' },
+  webhooks: { label: 'Webhooks', description: 'Record webhook endpoints and subscribed event names.', statuses: ['inactive', 'active'], fields: [urlField('url', 'Endpoint URL'), textField('events', 'Events', false, 'Comma-separated event names.'), textField('description', 'Description')], limitation: 'Webhook events are not emitted by this app.' },
+  settings: { label: 'Workspace settings', description: 'Store additional internal settings and notes.', statuses: ['active', 'inactive'], fields: [textField('key', 'Setting key', true), longField('value', 'Setting value'), longField('description', 'Description')], limitation: 'Use Store branding for the live storefront settings.' }
+};
 const moduleLabels: Record<string, string> = {
   returns: 'Returns & refunds', stock: 'Stock adjustments', customers: 'Customers',
   reports: 'Reports', content: 'Store content', inbox: 'Contact inbox'
@@ -172,41 +234,139 @@ function Operations() {
 function CustomersWorkspace() {
   const [items,setItems]=useState<Record<string,unknown>[]>([]);
   const [error,setError]=useState('');
-  useEffect(()=>{request<{items:Record<string,unknown>[]}>('/api/admin/customers?limit=100').then(data=>setItems(data.items)).catch(reason=>setError(String(reason)));},[]);
-  return <section className="admin-card"><h3>Guest customer history</h3><p className="fine-print">Customers are grouped by phone number. This is not a customer login or profile system.</p>{error&&<p className="form-error">{error}</p>}<div className="operations-table">{items.map((item,index)=><div className="operations-row" key={`${String(item.phone)}-${index}`}><strong>{String(item.customer_name)}</strong><span>{String(item.phone)}</span><span>{String(item.order_count)} orders · {String(item.delivered_count)} delivered</span><small>Last order {String(item.last_order)}</small></div>)}</div></section>;
+  const [query,setQuery]=useState('');
+  useEffect(()=>{const controller=new AbortController();const params=new URLSearchParams({limit:'100',q:query});request<{items:Record<string,unknown>[]}>(`/api/admin/customers?${params}`,{signal:controller.signal}).then(data=>setItems(data.items)).catch(reason=>{if(!controller.signal.aborted)setError(String(reason));});return()=>controller.abort();},[query]);
+  return <section className="admin-card"><h3>Guest customer history</h3><p className="fine-print">Customers are grouped by phone number. This is not a customer login or profile system.</p><label className="operation-module">Search customers<input type="search" maxLength={100} value={query} onChange={event=>setQuery(event.target.value)} placeholder="Name or phone number" /></label>{error&&<p className="form-error">{error}</p>}<div className="operations-table">{items.length?items.map((item,index)=><div className="operations-row" key={`${String(item.phone)}-${index}`}><strong>{String(item.customer_name)}</strong><span>{String(item.phone)}</span><span>{String(item.order_count)} orders · {String(item.delivered_count)} delivered · {formatMoney(Number(item.order_subtotal))} subtotal</span><small>Last order {String(item.last_order)}</small></div>):<p className="fine-print">No customer history matches this search.</p>}</div></section>;
 }
 
+function reportCell(key: string, value: unknown) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'number' && /(subtotal|amount|budget|price)/i.test(key)) return formatMoney(value);
+  return String(value);
+}
+function ReportContent({ value, label }: { value: unknown; label: string }) {
+  if (Array.isArray(value)) {
+    if (!value.length) return <p className="fine-print">No records for this report.</p>;
+    const rows = value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object' && !Array.isArray(row));
+    if (!rows.length) return <p className="fine-print">No records for this report.</p>;
+    const firstRow = rows[0];
+    if (!firstRow) return <p className="fine-print">No records for this report.</p>;
+    const columns = Object.keys(firstRow);
+    return <div className="report-table-wrap"><table className="report-table"><thead><tr>{columns.map(key=><th key={key}>{key.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{rows.map((row,index)=><tr key={String(row.id??row.day??row.status??index)}>{columns.map(key=><td key={key}>{reportCell(key,row[key])}</td>)}</tr>)}</tbody></table></div>;
+  }
+  if (value && typeof value === 'object') {
+    const entries=Object.entries(value as Record<string,unknown>);
+    const simple=entries.every(([,item])=>item===null||['string','number','boolean'].includes(typeof item));
+    if(simple)return <div className="report-metrics">{entries.map(([key,item])=><article key={key}><small>{key.replaceAll('_',' ')}</small><strong>{reportCell(key,item)}</strong></article>)}</div>;
+    return <div className="report-groups">{entries.map(([key,item])=><section className="report-group" key={key}><h3>{key.replaceAll('_',' ')}</h3><ReportContent value={item} label={key} /></section>)}</div>;
+  }
+  return <p className="fine-print">{reportCell(label,value)}</p>;
+}
 function ReportsWorkspace() {
   const [type,setType]=useState('sales');
   const [report,setReport]=useState<unknown>(null);
   const [error,setError]=useState('');
   useEffect(()=>{const controller=new AbortController();request(`/api/admin/reports?type=${type}`,{signal:controller.signal}).then(setReport).catch(reason=>{if(!controller.signal.aborted)setError(String(reason));});return()=>controller.abort();},[type]);
-  return <section className="admin-card"><label>Report<select value={type} onChange={event=>setType(event.target.value)}>{['sales','orders','products','inventory','customers','returns','payments'].map(name=><option key={name}>{name}</option>)}</select></label>{error&&<p className="form-error">{error}</p>}<pre className="report-data">{JSON.stringify(report,null,2)}</pre><p className="fine-print">Figures are calculated from local order and inventory records; ordered subtotals are not bank reconciliation.</p></section>;
+  return <section className="admin-card"><label className="operation-module">Report<select value={type} onChange={event=>setType(event.target.value)}>{['sales','orders','products','inventory','customers','returns','payments'].map(name=><option key={name}>{name}</option>)}</select></label>{error&&<p className="form-error">{error}</p>}<ReportContent value={report} label={type} /><p className="fine-print">Figures are calculated from local order and inventory records; ordered subtotals are not bank reconciliation.</p></section>;
 }
 
 function ContentWorkspace() {
-  const [module,setModule]=useState('pages');
+  const [module,setModule]=useState<ContentModule>('pages');
   const [items,setItems]=useState<Record<string,unknown>[]>([]);
   const [editing,setEditing]=useState<Record<string,unknown>|null>(null);
   const [title,setTitle]=useState('');
   const [status,setStatus]=useState('draft');
-  const [raw,setRaw]=useState('{\n  "slug": ""\n}');
+  const [values,setValues]=useState<Record<string,string>>({});
+  const [search,setSearch]=useState('');
   const [error,setError]=useState('');
-  const reload=useCallback(()=>request<{items:Record<string,unknown>[]}>(`/api/admin/workspace/${module}?limit=100`).then(data=>setItems(data.items)).catch(reason=>setError(String(reason))),[module]);
-  useEffect(()=>{setEditing(null);setTitle('');setStatus('draft');setRaw('{\n  "slug": ""\n}');setError('');void reload();},[module,reload]);
-  function edit(item:Record<string,unknown>){setEditing(item);setTitle(String(item.title));setStatus(String(item.status));setRaw(JSON.stringify(item.data,null,2));}
+  const [loading,setLoading]=useState(false);
+  const definition=contentDefinitions[module];
+  const emptyValues=()=>Object.fromEntries(definition.fields.map(field=>[field.key,'']));
+  const reload=useCallback(async()=>{
+    setLoading(true);setError('');
+    try{const params=new URLSearchParams({limit:'100',q:search});const data=await request<{items:Record<string,unknown>[]}>(`/api/admin/workspace/${module}?${params}`);setItems(data.items);}
+    catch(reason){setError(reason instanceof Error?reason.message:'Could not load records.');}
+    finally{setLoading(false);}
+  },[module,search]);
+  useEffect(()=>{setEditing(null);setTitle('');setStatus(contentDefinitions[module].statuses[0]||'draft');setValues(emptyValues());},[module]);
+  useEffect(()=>{void reload();},[reload]);
+  function resetForm(){setEditing(null);setTitle('');setStatus(definition.statuses[0]||'draft');setValues(emptyValues());}
+  function edit(item:Record<string,unknown>){
+    const data=(item.data||{}) as Record<string,unknown>;
+    setEditing(item);setTitle(String(item.title));setStatus(String(item.status));
+    setValues(Object.fromEntries(definition.fields.map(field=>{
+      const value=data[field.key];
+      if(value===undefined||value===null)return[field.key,''];
+      if(field.type==='datetime-local'){
+        const date=new Date(String(value));
+        return[field.key,Number.isNaN(date.getTime())?'':new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16)];
+      }
+      return[field.key,String(value)];
+    })));
+  }
   async function save(event:FormEvent<HTMLFormElement>){
     event.preventDefault();setError('');
-    let data:Record<string,unknown>;
-    try{data=JSON.parse(raw) as Record<string,unknown>;if(!data||Array.isArray(data)||typeof data!=='object')throw new Error('Details must be a JSON object.');}
-    catch(reason){setError(reason instanceof Error?reason.message:'Invalid JSON.');return;}
+    const data:Record<string,unknown>={};
+    for(const field of definition.fields){
+      const value=values[field.key]?.trim()||'';
+      if(!value)continue;
+      if(field.type==='number'){
+        const number=Number(value);
+        if(!Number.isFinite(number)){setError(`${field.label} must be a valid number.`);return;}
+        data[field.key]=number;
+      }else if(field.type==='datetime-local'){
+        const date=new Date(value);
+        if(Number.isNaN(date.getTime())){setError(`${field.label} must be a valid date and time.`);return;}
+        data[field.key]=date.toISOString();
+      }else data[field.key]=value;
+    }
     try{
       await request(`/api/admin/workspace/${module}${editing?`/${editing.id}`:''}`,{method:editing?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,status,data:{...data,...(editing?{version:editing.version}:{})}})});
-      setEditing(null);setTitle('');setStatus('draft');setRaw('{\n  "slug": ""\n}');await reload();
-    }catch(reason){setError(String(reason));}
+      resetForm();await reload();
+    }catch(reason){setError(reason instanceof Error?reason.message:'Could not save this record.');}
   }
-  async function remove(item:Record<string,unknown>){if(!confirm(`Delete “${String(item.title)}”?`))return;try{await request(`/api/admin/workspace/${module}/${item.id}`,{method:'DELETE'});await reload();}catch(reason){setError(String(reason));}}
-  return <div className="operations-grid"><section className="admin-card"><label>Content module<select value={module} onChange={event=>setModule(event.target.value)}>{contentModules.map(name=><option key={name} value={name}>{name.replaceAll('_',' ')}</option>)}</select></label><div className="operations-table">{items.map(item=><div className="operations-row" key={String(item.id)}><strong>{String(item.title)}</strong><span>{String(item.status)}</span><button className="filter-button" onClick={()=>edit(item)}>Edit</button><button className="filter-button" onClick={()=>void remove(item)}>Delete</button></div>)}</div></section><section className="admin-card"><h3>{editing?'Edit record':`Create ${module.replaceAll('_',' ')}`}</h3><form onSubmit={save}><label>Title<input required maxLength={160} value={title} onChange={event=>setTitle(event.target.value)} /></label><label>Status<select value={status} onChange={event=>setStatus(event.target.value)}>{['draft','published','active','inactive','archived','scheduled'].map(value=><option key={value}>{value}</option>)}</select></label><label>Details (JSON)<textarea className="json-editor" rows={12} value={raw} onChange={event=>setRaw(event.target.value)} /></label>{error&&<p className="form-error" role="alert">{error}</p>}<button className="button button-dark" type="submit">Save</button>{editing&&<button className="filter-button" type="button" onClick={()=>{setEditing(null);setTitle('');setStatus('draft');}}>Cancel</button>}</form><p className="fine-print">Pages, posts and FAQs marked published are served through the public content API. Other module records are administrative data and are not automatically wired into checkout or storefront components.</p></section></div>;
+  async function remove(item:Record<string,unknown>){
+    if(!confirm(`Delete “${String(item.title)}”?`))return;
+    try{await request(`/api/admin/workspace/${module}/${item.id}`,{method:'DELETE'});await reload();}
+    catch(reason){setError(reason instanceof Error?reason.message:'Could not delete this record.');}
+  }
+  const statusOptions=definition.statuses.includes(status)?definition.statuses:[status,...definition.statuses];
+  return <div className="content-workspace">
+    <div className="content-page-heading"><div><h3>{definition.label}</h3><p className="fine-print">{definition.description}</p></div><label className="operation-module">Page<select value={module} onChange={event=>{if(isContentModule(event.target.value))setModule(event.target.value);}}>{contentGroups.map(group=><optgroup key={group.label} label={group.label}>{group.modules.map(name=><option key={name} value={name}>{contentDefinitions[name].label}</option>)}</optgroup>)}</select></label></div>
+    <div className="operations-grid">
+      <section className="admin-card">
+        <label>Search records<input type="search" maxLength={100} value={search} onChange={event=>setSearch(event.target.value)} placeholder={`Search ${definition.label.toLowerCase()}`} /></label>
+        {error&&<p className="form-error" role="alert">{error}</p>}
+        <div className="operations-table" aria-live="polite">
+          {loading?<p className="fine-print">Loading records…</p>:items.length?items.map(item=>{
+            const data=(item.data||{}) as Record<string,unknown>;
+            const summary=definition.fields.filter(field=>data[field.key]!==undefined&&data[field.key]!==null&&String(data[field.key])!=='').slice(0,2);
+            return <article className="content-record" key={String(item.id)}>
+              <div><strong>{String(item.title)}</strong><span className="status-badge">{String(item.status)}</span></div>
+              {summary.map(field=><small key={field.key}><b>{field.label}:</b> {String(data[field.key])}</small>)}
+              <div className="dashboard-actions"><button className="filter-button" type="button" onClick={()=>edit(item)}>Edit</button><button className="filter-button" type="button" onClick={()=>void remove(item)}>Delete</button></div>
+            </article>;
+          }):<p className="fine-print">No {definition.label.toLowerCase()} found. Add the first record using the form.</p>}
+        </div>
+      </section>
+      <section className="admin-card">
+        <h3>{editing?`Edit ${definition.label} record`:`New ${definition.label} record`}</h3>
+        <form onSubmit={save}>
+          <label>Title<input required maxLength={160} value={title} onChange={event=>setTitle(event.target.value)} /></label>
+          <label>Status<select value={status} onChange={event=>setStatus(event.target.value)}>{statusOptions.map(value=><option key={value} value={value}>{value.replaceAll('_',' ')}</option>)}</select></label>
+          {definition.fields.map(field=><label key={field.key}>{field.label}
+            {field.type==='textarea'?<textarea required={field.required} maxLength={field.maxLength} rows={4} value={values[field.key]||''} onChange={event=>setValues({...values,[field.key]:event.target.value})} />:
+              field.type==='select'?<select required={field.required} value={values[field.key]||''} onChange={event=>setValues({...values,[field.key]:event.target.value})}><option value="">Select…</option>{field.options?.map(option=><option key={option} value={option}>{option}</option>)}</select>:
+                <input required={field.required} type={field.type||'text'} maxLength={field.maxLength} step={field.step} pattern={field.pattern} value={values[field.key]||''} onChange={event=>setValues({...values,[field.key]:event.target.value})} />}
+            {field.hint&&<small className="field-hint">{field.hint}</small>}
+          </label>)}
+          {error&&<p className="form-error" role="alert">{error}</p>}
+          <div className="dashboard-actions"><button className="button button-dark" type="submit">{editing?'Save changes':'Create record'}</button>{editing&&<button className="filter-button" type="button" onClick={resetForm}>Cancel edit</button>}</div>
+        </form>
+        {definition.limitation&&<p className="fine-print content-limitation">{definition.limitation}</p>}
+      </section>
+    </div>
+  </div>;
 }
 
 function InboxWorkspace() {

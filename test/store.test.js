@@ -77,14 +77,17 @@ test('catalog is populated and administration requires authentication', async ()
   assert.equal((await call('/api/admin/bank-settings', 'PUT', { bank_name: 'Test Bank', account_name: 'Store', account_number: '123', instructions: '' }, cookie)).status, 200);
 });
 test('checkout uses server prices, updates stock, and rejects invalid orders', async () => {
-  const payload = { name: 'Test customer', phone: '1234567', address: 'Test island', payment_proof: proof, expected_total: product.price * 2, items: [{ product_id: product.id, quantity: 2, price: 1 }] };
+  const payload = { name: 'Test customer', phone: '1234567', address: 'Test island', delivery_method: 'boat', payment_proof: proof, expected_total: product.price * 2, items: [{ product_id: product.id, quantity: 2, price: 1 }] };
   assert.equal((await call('/api/orders', 'POST', { ...payload, payment_proof: '' })).status, 400);
   assert.equal((await call('/api/orders', 'POST', { ...payload, payment_proof: Buffer.from('not a slip').toString('base64') })).status, 400);
+  assert.equal((await call('/api/orders', 'POST', { ...payload, delivery_method: 'submarine' })).status, 400);
   assert.equal((await call('/api/orders', 'POST', { ...payload, expected_total: 1 })).status, 409);
   const order = await call('/api/orders', 'POST', payload);
   assert.equal(order.status, 201);
   assert.equal(order.data.total, product.price * 2);
   orderId = order.data.id;
+  assert.equal((await call(`/api/admin/orders/${orderId}`, 'GET', undefined, cookie)).data.delivery_method, 'boat');
+  assert.equal((await call('/api/admin/overview', 'GET', undefined, cookie)).data.pending_payments, 1);
   assert.equal((await call(`/api/admin/orders/${orderId}`, 'PATCH', { status: 'confirmed' }, cookie)).status, 409);
   assert.equal((await fetch(`${base}/api/admin/orders/${orderId}/payment-proof`)).status, 401);
   const download = await fetch(`${base}/api/admin/orders/${orderId}/payment-proof`, { headers: { Cookie: cookie } });
@@ -94,6 +97,9 @@ test('checkout uses server prices, updates stock, and rejects invalid orders', a
   assert.equal((await call(`/api/admin/orders/${orderId}/payment`, 'PATCH', { status: 'rejected' }, cookie)).status, 200);
   assert.equal((await call(`/api/admin/orders/${orderId}`, 'PATCH', { status: 'confirmed' }, cookie)).status, 409);
   assert.equal((await call(`/api/admin/orders/${orderId}/payment`, 'PATCH', { status: 'verified' }, cookie)).status, 200);
+  assert.equal((await call('/api/admin/overview', 'GET', undefined, cookie)).data.pending_payments, 0);
+  assert.equal((await call('/api/admin/order-search?payment_status=verified', 'GET', undefined, cookie)).data.total, 1);
+  assert.equal((await call('/api/admin/order-search?payment_status=invalid', 'GET', undefined, cookie)).status, 400);
   assert.deepEqual((await call(`/api/admin/orders/${orderId}`, 'GET', undefined, cookie)).data.payment_history.map(item => item.status), ['verified', 'rejected', 'awaiting_verification']);
   const catalog = await call('/api/products');
   assert.equal(catalog.data.find(item => item.id === product.id).stock, product.stock - 2);
@@ -103,6 +109,9 @@ test('checkout uses server prices, updates stock, and rejects invalid orders', a
   const orders = await call('/api/admin/orders', 'GET', undefined, cookie);
   assert.equal(orders.data.length, 1);
   assert.equal(orders.data[0].items[0].unit_price, product.price);
+  assert.equal(orders.data[0].delivery_method, 'boat');
+  const searchedOrder = await call('/api/admin/order-search?payment_status=verified', 'GET', undefined, cookie);
+  assert.equal(searchedOrder.data.items[0].delivery_method, 'boat');
 });
 test('cancellation restores stock once and cannot be reopened', async () => {
   assert.equal((await call(`/api/admin/orders/${orderId}`, 'PATCH', { status: 'cancelled' }, cookie)).status, 200);
@@ -120,6 +129,66 @@ test('admin can add and edit products, and invalid prices are rejected', async (
   assert.equal((await call(`/api/admin/products/${created.data.id}`, 'PUT', { ...item, stock: 3, version: 0 }, cookie)).status, 409);
   const catalog = await call('/api/products');
   assert.equal(catalog.data.find(product => product.id === created.data.id).stock, 7);
+});
+test('product photo galleries support uploads, primary selection, ownership checks and limits', async () => {
+  const photo = { data: `data:image/png;base64,${proof}`, alt: 'Sample photo' };
+  const created = await call('/api/admin/products', 'POST', {
+    name: 'Gallery product', category: 'Test', description: 'Photo gallery', unit: 'piece',
+    price: 2500, original_price: null, stock: 2, image: '', featured: false, images: [photo, photo]
+  }, cookie);
+  assert.equal(created.status, 201);
+  const id = created.data.id;
+  assert.equal((await call(`/api/admin/products/${id}/images`)).status, 401);
+  let gallery = await call(`/api/admin/products/${id}/images`, 'GET', undefined, cookie);
+  assert.equal(gallery.status, 200);
+  assert.equal(gallery.data.items.length, 2);
+  assert.equal(gallery.data.items.filter(image => image.is_primary).length, 1);
+  assert.equal(gallery.data.version, 0);
+  const mainPhoto = await fetch(`${base}${gallery.data.items[0].url}`);
+  assert.equal(mainPhoto.status, 200);
+  assert.match(mainPhoto.headers.get('content-type'), /image\/png/);
+  assert.deepEqual(Buffer.from(await mainPhoto.arrayBuffer()), Buffer.from(proof, 'base64'));
+
+  const other = await call('/api/admin/products', 'POST', {
+    name: 'Other gallery product', category: 'Test', description: 'Separate gallery', unit: 'piece',
+    price: 2500, original_price: null, stock: 2, image: 'https://example.com/other.jpg', featured: false
+  }, cookie);
+  assert.equal(other.status, 201);
+  assert.equal((await call(`/api/admin/products/${other.data.id}`, 'PUT', {
+    name: 'Other gallery product', category: 'Test', description: 'Separate gallery', unit: 'piece',
+    price: 2500, original_price: null, stock: 2, image: gallery.data.items[0].url, featured: false, version: 0
+  }, cookie)).status, 400);
+
+  const selected = gallery.data.items[1];
+  const setPrimary = await call(`/api/admin/products/${id}/images/${selected.id}/primary`, 'PUT', { version: 0 }, cookie);
+  assert.equal(setPrimary.status, 200);
+  assert.equal(setPrimary.data.version, 1);
+  assert.equal(setPrimary.data.image, selected.url);
+  assert.equal((await call(`/api/admin/products/${id}/images/${selected.id}`, 'DELETE', undefined, cookie)).status, 409);
+  const removeOldMain = await call(`/api/admin/products/${id}/images/${gallery.data.items[0].id}`, 'DELETE', undefined, cookie);
+  assert.equal(removeOldMain.status, 200);
+  assert.equal(removeOldMain.data.items.length, 1);
+  assert.equal(removeOldMain.data.version, 2);
+  const uploaded = await call(`/api/admin/products/${id}/images`, 'POST', { images: [photo, photo], primaryIndex: 1 }, cookie);
+  assert.equal(uploaded.status, 201);
+  assert.equal(uploaded.data.items.length, 3);
+  assert.equal(uploaded.data.items.filter(image => image.is_primary).length, 1);
+  assert.equal(uploaded.data.version, 3);
+  assert.equal((await call('/api/products')).data.find(item => item.id === id).image, uploaded.data.items.find(image => image.is_primary).url);
+
+  const invalidPhoto = { data: `data:image/png;base64,${Buffer.from('not a png').toString('base64')}` };
+  assert.equal((await call(`/api/admin/products/${id}/images`, 'POST', { images: [invalidPhoto] }, cookie)).status, 400);
+  assert.equal((await call(`/api/admin/products/${id}/images`, 'POST', { images: [photo], primaryIndex: 1 }, cookie)).status, 400);
+  const oversized = Buffer.alloc(4 * 1024 * 1024 + 1);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(oversized);
+  assert.equal((await call(`/api/admin/products/${id}/images`, 'POST', { images: [{ data: `data:image/png;base64,${oversized.toString('base64')}` }] }, cookie)).status, 400);
+
+  const full = await call('/api/admin/products', 'POST', {
+    name: 'Full gallery product', category: 'Test', description: 'Gallery limit', unit: 'piece',
+    price: 2500, original_price: null, stock: 2, image: '', featured: false, images: Array(8).fill(photo)
+  }, cookie);
+  assert.equal(full.status, 201);
+  assert.equal((await call(`/api/admin/products/${full.data.id}/images`, 'POST', { images: [photo] }, cookie)).status, 409);
 });
 test('overview, order history, and paginated filters reflect store activity', async () => {
   const search = await call('/api/admin/order-search?q=Test%20customer&status=cancelled&limit=1&offset=0', 'GET', undefined, cookie);
@@ -190,13 +259,15 @@ test('manual backups are readable and preserve stored orders', async () => {
 test('migration preserves legacy orders and bootstraps the admin only once', () => {
   const legacy = new DatabaseSync(':memory:');
   try {
-    legacy.exec("PRAGMA foreign_keys=ON; CREATE TABLE products (id INTEGER PRIMARY KEY); INSERT INTO products VALUES (1); CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, created_at TEXT); INSERT INTO orders VALUES (12, 'delivered', '2026-01-01 10:00:00'); CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER); INSERT INTO order_items VALUES (1, 12, 1);");
+    legacy.exec("PRAGMA foreign_keys=ON; CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, image TEXT); INSERT INTO products VALUES (1, 'Legacy product', 'https://example.com/legacy.jpg'); CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, created_at TEXT); INSERT INTO orders VALUES (12, 'delivered', '2026-01-01 10:00:00'); CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER); INSERT INTO order_items VALUES (1, 12, 1);");
     migrate(legacy, 'legacy-password');
-    assert.equal(legacy.prepare('PRAGMA user_version').get().user_version, 7);
+    assert.equal(legacy.prepare('PRAGMA user_version').get().user_version, 9);
     assert.equal(legacy.prepare('SELECT payment_status FROM orders WHERE id=12').get().payment_status, 'legacy');
+    assert.equal(legacy.prepare('SELECT delivery_method FROM orders WHERE id=12').get().delivery_method, 'standard');
     assert.equal(legacy.prepare('SELECT variant_id FROM order_items WHERE id=1').get().variant_id, null);
     assert.equal(legacy.prepare('SELECT version FROM products WHERE id=1').get().version, 0);
     assert.equal(legacy.prepare('SELECT status FROM order_history WHERE order_id=12').get().status, 'delivered');
+    assert.equal(legacy.prepare('SELECT image_url FROM product_images WHERE product_id=1 AND is_primary=1').get().image_url, 'https://example.com/legacy.jpg');
     const admin = legacy.prepare('SELECT * FROM staff_users').get();
     assert.equal(admin.username, 'admin');
     assert.equal(admin.password_hash, passwordHash('legacy-password', admin.password_salt));
@@ -204,13 +275,23 @@ test('migration preserves legacy orders and bootstraps the admin only once', () 
     assert.equal(legacy.prepare('SELECT password_hash FROM staff_users').get().password_hash, admin.password_hash);
   } finally { legacy.close(); }
 });
-test('a version 1 database upgrades to version 2 without recreating staff', () => {
+test('a version 1 database upgrades to the latest schema without recreating staff', () => {
   const existing = new DatabaseSync(':memory:');
   try {
-    existing.exec("CREATE TABLE products (id INTEGER PRIMARY KEY); INSERT INTO products VALUES (1); CREATE TABLE orders (id INTEGER PRIMARY KEY); CREATE TABLE order_items (id INTEGER PRIMARY KEY); CREATE TABLE staff_users (id INTEGER PRIMARY KEY); INSERT INTO staff_users VALUES (1); PRAGMA user_version = 1;");
+    existing.exec("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, image TEXT); INSERT INTO products VALUES (1, 'Legacy product', 'https://example.com/legacy.jpg'); CREATE TABLE orders (id INTEGER PRIMARY KEY); CREATE TABLE order_items (id INTEGER PRIMARY KEY); CREATE TABLE staff_users (id INTEGER PRIMARY KEY); INSERT INTO staff_users VALUES (1); PRAGMA user_version = 1;");
     migrate(existing, 'ignored-bootstrap-password');
-    assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 7);
+    assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 9);
     assert.equal(existing.prepare('SELECT version FROM products WHERE id=1').get().version, 0);
+    assert.equal(existing.prepare('SELECT COUNT(*) AS count FROM staff_users').get().count, 1);
+  } finally { existing.close(); }
+});
+test('a version 8 database adds standard delivery for existing orders', () => {
+  const existing = new DatabaseSync(':memory:');
+  try {
+    existing.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY); INSERT INTO orders VALUES (12); CREATE TABLE staff_users (id INTEGER PRIMARY KEY); INSERT INTO staff_users VALUES (1); PRAGMA user_version=8;");
+    migrate(existing, '');
+    assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 9);
+    assert.equal(existing.prepare('SELECT delivery_method FROM orders WHERE id=12').get().delivery_method, 'standard');
     assert.equal(existing.prepare('SELECT COUNT(*) AS count FROM staff_users').get().count, 1);
   } finally { existing.close(); }
 });
@@ -219,8 +300,8 @@ test('version 2, 3, and 4 databases upgrade without losing store data', () => {
     const existing = new DatabaseSync(':memory:');
     try {
       existing.exec(`PRAGMA foreign_keys=ON;
-        CREATE TABLE products (id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0);
-        INSERT INTO products VALUES (1, 7);
+        CREATE TABLE products (id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0, name TEXT, image TEXT);
+        INSERT INTO products VALUES (1, 7, 'Legacy product', 'https://example.com/legacy.jpg');
         CREATE TABLE orders (id INTEGER PRIMARY KEY);
         INSERT INTO orders VALUES (12);
         CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER);
@@ -242,7 +323,7 @@ test('version 2, 3, and 4 databases upgrade without losing store data', () => {
       `);
       existing.exec(`PRAGMA user_version=${version}`);
       migrate(existing, '');
-      assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 7);
+      assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 9);
       assert.equal(existing.prepare('SELECT version FROM products WHERE id=1').get().version, 7);
       assert.equal(existing.prepare('SELECT payment_status FROM orders WHERE id=12').get().payment_status, 'legacy');
       assert.equal(existing.prepare('SELECT variant_id FROM order_items WHERE id=1').get().variant_id, version >= 3 ? 5 : null);
@@ -430,6 +511,20 @@ test('reports, guest customers, content CRUD and contact inbox use stored data',
   assert.equal(message.status, 201);
   assert.equal((await call('/api/admin/contact-messages', 'GET', undefined, cookie)).data.items[0].message, 'Please contact me.');
   assert.equal((await call(`/api/admin/contact-messages/${message.data.id}`, 'PATCH', { status: 'resolved' }, cookie)).status, 200);
+});
+test('every configured store-content page has a working records endpoint', async () => {
+  const modules = [
+    'pages', 'blog_posts', 'blog_categories', 'faqs', 'navigation', 'popups',
+    'testimonials', 'testimonial_categories', 'brands', 'collections', 'attributes',
+    'tags', 'reviews', 'coupons', 'promotions', 'gift_cards', 'campaigns',
+    'email_templates', 'email_drafts', 'notifications', 'media', 'teams',
+    'roles', 'permissions', 'integrations', 'webhooks', 'settings'
+  ];
+  for (const module of modules) {
+    const response = await call(`/api/admin/workspace/${module}?limit=1`, 'GET', undefined, cookie);
+    assert.equal(response.status, 200, `${module} workspace should load`);
+    assert.ok(Array.isArray(response.data.items), `${module} workspace should return records`);
+  }
 });
 test('active coupons validate, apply atomically, respect redemption caps, and release on cancellation', async () => {
   const coupon = await call('/api/admin/workspace/coupons', 'POST', { title: 'Ten percent', status: 'active', data: { code: 'SAVE10', discount_type: 'percentage', value: 10, max_redemptions: 1 } }, cookie);

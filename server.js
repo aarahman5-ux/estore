@@ -157,11 +157,56 @@ function searchTerm(url) {
 function productInput(input) {
   const price = integer(input.price, 'price', 0, 100000000);
   const originalPrice = input.original_price === null ? null : integer(input.original_price, 'original price', price, 100000000);
-  const image = text(input.image, 'Image URL', 1000);
-  let url;
-  try { url = new URL(image); } catch { throw fail(400, 'Image must be a valid HTTPS URL.'); }
-  if (url.protocol !== 'https:') throw fail(400, 'Image must be a valid HTTPS URL.');
+  const image = input.image == null || input.image === '' ? '' : text(input.image, 'Image URL', 1000);
+  if (image && !/^\/api\/product-images\/\d+$/.test(image)) {
+    let url;
+    try { url = new URL(image); } catch { throw fail(400, 'Image must be a valid HTTPS URL or an uploaded product photo.'); }
+    if (url.protocol !== 'https:') throw fail(400, 'Image must be a valid HTTPS URL or an uploaded product photo.');
+  }
   return [text(input.name, 'Name', 120), text(input.category, 'Category', 80), text(input.description, 'Description', 1000), text(input.unit, 'Unit', 80), price, originalPrice, integer(input.stock, 'stock', 0, 100000), image, input.featured === true ? 1 : 0];
+}
+const MAX_PRODUCT_IMAGES = 8;
+const MAX_PRODUCT_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_PRODUCT_IMAGE_BATCH_BYTES = 16 * 1024 * 1024;
+function productPhotoInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw fail(400, 'Invalid product photo.');
+  const match = typeof input.data === 'string' && input.data.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/);
+  if (!match) throw fail(400, 'Choose a JPEG, PNG, or WebP product photo.');
+  const content = Buffer.from(match[2], 'base64');
+  if (!content.length || content.length > MAX_PRODUCT_IMAGE_BYTES || content.toString('base64') !== match[2]) throw fail(400, 'Each product photo must be no larger than 4 MB.');
+  const type = match[1];
+  const validSignature = type === 'image/jpeg' ? content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff
+    : type === 'image/png' ? content.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      : content.length >= 12 && content.toString('ascii', 0, 4) === 'RIFF' && content.toString('ascii', 8, 12) === 'WEBP';
+  if (!validSignature) throw fail(400, 'The photo content does not match its image type.');
+  return { type, content, alt: optionalText(input.alt || '', 'Photo description', 200) };
+}
+function productGallery(productId) {
+  return db.prepare(`SELECT id,image_url,content_type,alt,is_primary,sort_order FROM product_images
+    WHERE product_id=? ORDER BY is_primary DESC,sort_order,id`).all(productId).map(image => ({
+    id: image.id,
+    url: image.image_url || `/api/product-images/${image.id}`,
+    content_type: image.content_type,
+    alt: image.alt,
+    is_primary: Boolean(image.is_primary),
+    sort_order: image.sort_order
+  }));
+}
+function syncPrimaryProductImage(productId, imageUrl, alt) {
+  const images = db.prepare('SELECT id,image_url FROM product_images WHERE product_id=?').all(productId);
+  const selected = images.find(image => image.image_url === imageUrl || `/api/product-images/${image.id}` === imageUrl);
+  db.prepare('UPDATE product_images SET is_primary=0 WHERE product_id=?').run(productId);
+  if (selected) {
+    db.prepare('UPDATE product_images SET is_primary=1,sort_order=0,alt=? WHERE id=? AND product_id=?').run(alt, selected.id, productId);
+    return;
+  }
+  const currentPrimary = db.prepare('SELECT id FROM product_images WHERE product_id=? ORDER BY is_primary DESC,sort_order,id LIMIT 1').get(productId);
+  if (currentPrimary) {
+    db.prepare('UPDATE product_images SET image_url=?,content_type=NULL,content=NULL,alt=?,is_primary=1,sort_order=0 WHERE id=?')
+      .run(imageUrl, alt, currentPrimary.id);
+    return;
+  }
+  db.prepare('INSERT INTO product_images(product_id,image_url,alt,is_primary,sort_order) VALUES(?,?,?,1,0)').run(productId, imageUrl, alt);
 }
 function variantInput(input) {
   return [text(input.name, 'Variant name', 80), integer(input.price, 'price', 0, 100000000), integer(input.stock, 'stock', 0, 100000)];
@@ -230,9 +275,22 @@ function couponDiscount(coupon, subtotal) {
 async function api(req, res, url) {
   const pathname = url.pathname;
   if (req.method !== 'GET') sameOrigin(req);
+  const publicProductImageMatch = pathname.match(/^\/api\/product-images\/(\d+)$/);
+  if (req.method === 'GET' && publicProductImageMatch) {
+    const image = db.prepare('SELECT content_type,content FROM product_images WHERE id=?').get(Number(publicProductImageMatch[1]));
+    if (!image || !image.content) throw fail(404, 'Product photo not found.');
+    res.writeHead(200, {
+      'Content-Type': image.content_type,
+      'Content-Length': image.content.length,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; sandbox"
+    });
+    return res.end(image.content);
+  }
   if (req.method === 'GET' && pathname === '/api/products') {
     const variants = db.prepare('SELECT id, name, price, stock FROM product_variants WHERE product_id=? ORDER BY name COLLATE NOCASE, id');
-    return json(res, 200, db.prepare('SELECT * FROM products ORDER BY id').all().map(product => ({ ...product, variants: variants.all(product.id) })));
+    return json(res, 200, db.prepare('SELECT * FROM products ORDER BY id').all().map(product => ({ ...product, variants: variants.all(product.id), images: productGallery(product.id) })));
   }
   if (req.method === 'GET' && pathname === '/api/payment-settings') {
     const settings = db.prepare('SELECT bank_name, account_name, account_number, instructions FROM bank_settings WHERE id=1').get();
@@ -274,6 +332,8 @@ async function api(req, res, url) {
     const name = text(input.name, 'Name', 100);
     const phone = text(input.phone, 'Phone', 40);
     const address = text(input.address, 'Address', 500);
+    const deliveryMethod = input.delivery_method === undefined ? 'standard' : input.delivery_method;
+    if (!['standard', 'boat'].includes(deliveryMethod)) throw fail(400, 'Choose a valid delivery method.');
     const expectedTotal = integer(input.expected_total, 'order subtotal', 0, Number.MAX_SAFE_INTEGER);
     const couponCode=input.coupon_code===undefined?'':optionalText(input.coupon_code,'Coupon code',80).toUpperCase();
     if (input.notes !== undefined && (typeof input.notes !== 'string' || input.notes.length > 500)) throw fail(400, 'Notes must be at most 500 characters.');
@@ -303,7 +363,7 @@ async function api(req, res, url) {
       const coupon=couponCode?couponFor(couponCode):null;
       const discount=coupon?couponDiscount(coupon,total):0;
       if (total-discount !== expectedTotal) throw fail(409, 'Prices or discounts have changed. Please review your updated basket before ordering.');
-      const order = db.prepare("INSERT INTO orders (customer_name, phone, address, notes, total, discount, payment_status) VALUES (?, ?, ?, ?, ?, ?, 'awaiting_verification')").run(name, phone, address, (input.notes || '').trim(), total-discount, discount);
+      const order = db.prepare("INSERT INTO orders (customer_name, phone, address, notes, total, discount, payment_status, delivery_method) VALUES (?, ?, ?, ?, ?, ?, 'awaiting_verification', ?)").run(name, phone, address, (input.notes || '').trim(), total-discount, discount, deliveryMethod);
       db.prepare('INSERT INTO order_history (order_id, status, actor) VALUES (?, ?, ?)').run(order.lastInsertRowid, 'pending', 'Customer');
       db.prepare('INSERT INTO payment_proofs (order_id, file_type, content) VALUES (?, ?, ?)').run(order.lastInsertRowid, proof.type, proof.content);
       db.prepare('INSERT INTO payment_history (order_id, status, actor) VALUES (?, ?, ?)').run(order.lastInsertRowid, 'awaiting_verification', 'Customer');
@@ -664,7 +724,8 @@ async function api(req, res, url) {
         SUM(CASE WHEN status IN ('confirmed','preparing','out for delivery') THEN 1 ELSE 0 END) AS in_progress,
         SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
         SUM(CASE WHEN status='delivered' THEN total ELSE 0 END) AS delivered_subtotal,
-        SUM(CASE WHEN date(created_at)=date('now') THEN 1 ELSE 0 END) AS today_orders
+        SUM(CASE WHEN date(created_at)=date('now') THEN 1 ELSE 0 END) AS today_orders,
+        SUM(CASE WHEN payment_status='awaiting_verification' THEN 1 ELSE 0 END) AS pending_payments
         FROM orders`).get();
       const low = db.prepare('SELECT COUNT(*) AS count FROM products WHERE stock<=5').get().count;
       const recent = db.prepare('SELECT id, customer_name, status, total, created_at FROM orders ORDER BY id DESC LIMIT 5').all();
@@ -682,7 +743,8 @@ async function api(req, res, url) {
       return json(res, 200, {
         pending: orders.pending || 0, in_progress: orders.in_progress || 0,
         delivered: orders.delivered || 0, delivered_subtotal: orders.delivered_subtotal || 0,
-        today_orders: orders.today_orders || 0, catalog_products: catalogProducts, low_stock: low,
+        today_orders: orders.today_orders || 0, pending_payments: orders.pending_payments || 0,
+        catalog_products: catalogProducts, low_stock: low,
         recent, activity, top_products: topProducts, low_stock_items: lowStockItems
       });
     }
@@ -690,11 +752,13 @@ async function api(req, res, url) {
       const { limit, offset } = paging(url);
       const term = searchTerm(url);
       const status = url.searchParams.get('status') || '';
+      const paymentStatus = url.searchParams.get('payment_status') || '';
       if (status && !['pending', 'confirmed', 'preparing', 'out for delivery', 'delivered', 'cancelled', 'in_progress'].includes(status)) throw fail(400, 'Invalid order status.');
-      const where = "WHERE (CAST(id AS TEXT) LIKE ? ESCAPE '\\' OR customer_name LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\') AND (?='' OR status=? OR (?='in_progress' AND status IN ('confirmed','preparing','out for delivery')))";
-      const params = [term, term, term, status, status, status];
+      if (paymentStatus && !['awaiting_verification', 'verified', 'rejected', 'legacy'].includes(paymentStatus)) throw fail(400, 'Invalid payment status filter.');
+      const where = "WHERE (CAST(id AS TEXT) LIKE ? ESCAPE '\\' OR customer_name LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\') AND (?='' OR status=? OR (?='in_progress' AND status IN ('confirmed','preparing','out for delivery'))) AND (?='' OR payment_status=?)";
+      const params = [term, term, term, status, status, status, paymentStatus, paymentStatus];
       const total = db.prepare(`SELECT COUNT(*) AS count FROM orders ${where}`).get(...params).count;
-      const items = db.prepare(`SELECT id, customer_name, phone, status, payment_status, total, created_at FROM orders ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+      const items = db.prepare(`SELECT id, customer_name, phone, status, payment_status, delivery_method, total, created_at FROM orders ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
       return json(res, 200, { items, total, limit, offset });
     }
     if (pathname === '/api/admin/product-search' && req.method === 'GET') {
@@ -780,10 +844,107 @@ async function api(req, res, url) {
       const items = db.prepare('SELECT name, unit_price, quantity FROM order_items WHERE order_id = ?');
       return json(res, 200, orders.map(order => ({ ...order, items: items.all(order.id) })));
     }
+    const productImagesMatch = pathname.match(/^\/api\/admin\/products\/(\d+)\/images$/);
+    if (productImagesMatch && req.method === 'GET') {
+      const productId = Number(productImagesMatch[1]);
+      const product = db.prepare('SELECT version FROM products WHERE id=?').get(productId);
+      if (!product) throw fail(404, 'Product not found.');
+      return json(res, 200, { items: productGallery(productId), version: product.version });
+    }
+    if (productImagesMatch && req.method === 'POST') {
+      const productId = Number(productImagesMatch[1]);
+      const input = await body(req, 22 * 1024 * 1024);
+      if (!Array.isArray(input.images) || input.images.length < 1 || input.images.length > MAX_PRODUCT_IMAGES) throw fail(400, `Upload between 1 and ${MAX_PRODUCT_IMAGES} photos.`);
+      const photos = input.images.map(productPhotoInput);
+      const primaryIndex = input.primaryIndex == null ? null : integer(input.primaryIndex, 'main photo index', 0, photos.length - 1);
+      if (photos.reduce((sum, photo) => sum + photo.content.length, 0) > MAX_PRODUCT_IMAGE_BATCH_BYTES) throw fail(413, 'Photos in one upload cannot exceed 16 MB total.');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const product = db.prepare('SELECT id,version,name FROM products WHERE id=?').get(productId);
+        if (!product) throw fail(404, 'Product not found.');
+        const count = db.prepare('SELECT COUNT(*) AS count FROM product_images WHERE product_id=?').get(productId).count;
+        if (count + photos.length > MAX_PRODUCT_IMAGES) throw fail(409, `A product can have up to ${MAX_PRODUCT_IMAGES} photos, including its main photo.`);
+        const insert = db.prepare('INSERT INTO product_images(product_id,content_type,content,alt,is_primary,sort_order) VALUES(?,?,?,?,?,?)');
+        const inserted = photos.map((photo, index) => Number(insert.run(productId, photo.type, photo.content, photo.alt || product.name, 0, count + index).lastInsertRowid));
+        if (primaryIndex !== null) {
+          const imageId = inserted[primaryIndex];
+          const imageUrl = `/api/product-images/${imageId}`;
+          db.prepare('UPDATE product_images SET is_primary=0 WHERE product_id=?').run(productId);
+          db.prepare('UPDATE product_images SET is_primary=1,sort_order=0 WHERE id=? AND product_id=?').run(imageId, productId);
+          db.prepare('UPDATE products SET image=? WHERE id=?').run(imageUrl, productId);
+        }
+        const result = db.prepare('UPDATE products SET version=version+1 WHERE id=? AND version=?').run(productId, product.version);
+        if (!result.changes) throw fail(409, 'Product changed while adding photos. Refresh the product and try again.');
+        db.exec('COMMIT');
+        const updated = db.prepare('SELECT version FROM products WHERE id=?').get(productId);
+        return json(res, 201, { items: productGallery(productId), version: updated.version });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    }
+    const productImagePrimaryMatch = pathname.match(/^\/api\/admin\/products\/(\d+)\/images\/(\d+)\/primary$/);
+    if (productImagePrimaryMatch && req.method === 'PUT') {
+      const input = await body(req);
+      const productId = Number(productImagePrimaryMatch[1]);
+      const imageId = Number(productImagePrimaryMatch[2]);
+      const version = integer(input.version, 'product version', 0, Number.MAX_SAFE_INTEGER);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const image = db.prepare('SELECT image_url,id FROM product_images WHERE id=? AND product_id=?').get(imageId, productId);
+        if (!image) throw fail(404, 'Product photo not found.');
+        const imageUrl = image.image_url || `/api/product-images/${image.id}`;
+        const result = db.prepare('UPDATE products SET image=?,version=version+1 WHERE id=? AND version=?').run(imageUrl, productId, version);
+        if (!result.changes) {
+          if (!db.prepare('SELECT id FROM products WHERE id=?').get(productId)) throw fail(404, 'Product not found.');
+          throw fail(409, 'Product changed while selecting its main photo. Refresh and try again.');
+        }
+        db.prepare('UPDATE product_images SET is_primary=0 WHERE product_id=?').run(productId);
+        db.prepare('UPDATE product_images SET is_primary=1,sort_order=0 WHERE id=? AND product_id=?').run(imageId, productId);
+        db.exec('COMMIT');
+        return json(res, 200, { ok: true, version: version + 1, image: imageUrl });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    }
+    const productImageMatch = pathname.match(/^\/api\/admin\/products\/(\d+)\/images\/(\d+)$/);
+    if (productImageMatch && req.method === 'DELETE') {
+      const productId = Number(productImageMatch[1]);
+      const imageId = Number(productImageMatch[2]);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const image = db.prepare('SELECT is_primary FROM product_images WHERE id=? AND product_id=?').get(imageId, productId);
+        if (!image) throw fail(404, 'Product photo not found.');
+        if (image.is_primary) throw fail(409, 'Choose another main photo before removing this one.');
+        db.prepare('DELETE FROM product_images WHERE id=? AND product_id=?').run(imageId, productId);
+        const result = db.prepare('UPDATE products SET version=version+1 WHERE id=?').run(productId);
+        if (!result.changes) throw fail(404, 'Product not found.');
+        db.exec('COMMIT');
+        const updated = db.prepare('SELECT version FROM products WHERE id=?').get(productId);
+        return json(res, 200, { items: productGallery(productId), version: updated.version });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    }
     if (req.method === 'POST' && pathname === '/api/admin/products') {
-      const values = productInput(await body(req));
-      const result = db.prepare('INSERT INTO products (name, category, description, unit, price, original_price, stock, image, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...values);
-      return json(res, 201, { id: Number(result.lastInsertRowid) });
+      const input = await body(req, 22 * 1024 * 1024);
+      const values = productInput(input);
+      const photos = input.images === undefined ? [] : input.images;
+      if (!Array.isArray(photos) || photos.length > MAX_PRODUCT_IMAGES) throw fail(400, `Upload up to ${MAX_PRODUCT_IMAGES} photos.`);
+      const validatedPhotos = photos.map(productPhotoInput);
+      if (validatedPhotos.reduce((sum, photo) => sum + photo.content.length, 0) > MAX_PRODUCT_IMAGE_BATCH_BYTES) throw fail(413, 'Photos in one upload cannot exceed 16 MB total.');
+      if (!values[7] && !validatedPhotos.length) throw fail(400, 'Add a main photo URL or upload at least one product photo.');
+      if (/^\/api\/product-images\/\d+$/.test(values[7])) throw fail(400, 'Upload a photo after creating the product.');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = db.prepare('INSERT INTO products (name, category, description, unit, price, original_price, stock, image, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...values);
+        const productId = Number(result.lastInsertRowid);
+        if (values[7]) {
+          db.prepare('INSERT INTO product_images(product_id,image_url,alt,is_primary,sort_order) VALUES(?,?,?,1,0)').run(productId, values[7], values[0]);
+          const insertPhoto = db.prepare('INSERT INTO product_images(product_id,content_type,content,alt,is_primary,sort_order) VALUES(?,?,?,?,0,?)');
+          validatedPhotos.forEach((photo, index) => insertPhoto.run(productId, photo.type, photo.content, photo.alt || values[0], index + 1));
+        } else {
+          const insertPhoto = db.prepare('INSERT INTO product_images(product_id,content_type,content,alt,is_primary,sort_order) VALUES(?,?,?,?,?,?)');
+          const firstId = Number(insertPhoto.run(productId, validatedPhotos[0].type, validatedPhotos[0].content, validatedPhotos[0].alt || values[0], 1, 0).lastInsertRowid);
+          db.prepare('UPDATE products SET image=? WHERE id=?').run(`/api/product-images/${firstId}`, productId);
+          validatedPhotos.slice(1).forEach((photo, index) => insertPhoto.run(productId, photo.type, photo.content, photo.alt || values[0], 0, index + 1));
+        }
+        db.exec('COMMIT');
+        return json(res, 201, { id: productId, version: 0 });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
     }
     const variantsMatch = pathname.match(/^\/api\/admin\/products\/(\d+)\/variants$/);
     if (variantsMatch && req.method === 'GET') {
@@ -828,13 +989,24 @@ async function api(req, res, url) {
     if (req.method === 'PUT' && productMatch) {
       const input = await body(req);
       const values = productInput(input);
+      if (!values[7]) throw fail(400, 'Choose a main photo before saving the product.');
       const version = integer(input.version, 'product version', 0, Number.MAX_SAFE_INTEGER);
-      const result = db.prepare('UPDATE products SET name=?, category=?, description=?, unit=?, price=?, original_price=?, stock=?, image=?, featured=?, version=version+1 WHERE id=? AND version=?').run(...values, Number(productMatch[1]), version);
-      if (!result.changes) {
-        if (!db.prepare('SELECT id FROM products WHERE id=?').get(Number(productMatch[1]))) throw fail(404, 'Product not found.');
-        throw fail(409, 'This product changed since you opened it. Close the form, refresh the product list, and try again.');
+      const productId = Number(productMatch[1]);
+      if (/^\/api\/product-images\/\d+$/.test(values[7])) {
+        const imageId = Number(values[7].split('/').pop());
+        if (!db.prepare('SELECT id FROM product_images WHERE id=? AND product_id=?').get(imageId, productId)) throw fail(400, 'Choose a photo from this product gallery.');
       }
-      return json(res, 200, { ok: true });
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = db.prepare('UPDATE products SET name=?, category=?, description=?, unit=?, price=?, original_price=?, stock=?, image=?, featured=?, version=version+1 WHERE id=? AND version=?').run(...values, productId, version);
+        if (!result.changes) {
+          if (!db.prepare('SELECT id FROM products WHERE id=?').get(productId)) throw fail(404, 'Product not found.');
+          throw fail(409, 'This product changed since you opened it. Close the form, refresh the product list, and try again.');
+        }
+        syncPrimaryProductImage(productId, values[7], values[0]);
+        db.exec('COMMIT');
+        return json(res, 200, { ok: true, version: version + 1 });
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
     }
     const orderMatch = pathname.match(/^\/api\/admin\/orders\/(\d+)$/);
     if (req.method === 'PATCH' && orderMatch) {

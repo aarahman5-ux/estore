@@ -73,9 +73,11 @@ function productCard(product) {
   const discount = product.original_price ? Math.round((1 - product.price / product.original_price) * 100) : 0;
   const variants = product.variants || [];
   const available = product.stock > 0 || variants.some(variant => variant.stock > 0);
+  const photoCount = product.images?.length || 1;
   return `<article class="product-card">
     <div class="product-image-wrap"><img class="product-image" src="${escapeHTML(product.image)}" alt="${escapeHTML(product.name)}" loading="lazy">
       ${!available ? '<span class="badge sold-out">OUT OF STOCK</span>' : discount ? `<span class="badge">SAVE ${discount}%</span>` : ''}
+      ${photoCount > 1 ? `<span class="photo-count">${photoCount} photos</span>` : ''}
     </div>
     <div class="product-info"><span class="product-category">${escapeHTML(product.category)}</span>
       <button class="product-title" data-detail="${product.id}"><span class="product-name">${escapeHTML(product.name)}</span></button>
@@ -170,13 +172,25 @@ function showDetail(id) {
   if (!product) return;
   const variants = product.variants || [];
   const available = product.stock > 0 || variants.some(variant => variant.stock > 0);
+  const images = product.images?.length ? product.images : [{ url: product.image, alt: product.name, is_primary: true }];
+  const mainImage = images.find(image => image.is_primary) || images[0];
   const options = variants.length ? `<label>Choose an option<select id="detail-variant"><option value="" ${product.stock === 0 ? 'disabled' : ''}>Standard · ${money(product.price)}${product.stock === 0 ? ' · Out of stock' : ''}</option>${variants.map(variant => `<option value="${variant.id}" ${variant.stock === 0 ? 'disabled' : ''}>${escapeHTML(variant.name)} · ${money(variant.price)}${variant.stock === 0 ? ' · Out of stock' : ''}</option>`).join('')}</select></label>` : '';
-  $('#product-detail').innerHTML = `<img class="detail-image" src="${escapeHTML(product.image)}" alt="${escapeHTML(product.name)}"><p class="product-category">${escapeHTML(product.category)}</p><h2>${escapeHTML(product.name)}</h2><p class="dialog-intro">${escapeHTML(product.description)}</p><p>${escapeHTML(product.unit)} · Standard ${money(product.price)}</p>${options}<button class="button button-dark full-width" data-add="${product.id}" ${variants.length ? 'data-select-variant="true"' : ''} ${!available ? 'disabled' : ''}>${!available ? 'Out of stock' : 'Add to basket'} ${icon('plus')}</button>`;
+  const gallery = images.length > 1 ? `<div class="detail-gallery" aria-label="Product photos">${images.map((image,index)=>`<button class="detail-gallery-thumb ${image.url===mainImage.url?'active':''}" type="button" data-gallery-image="${escapeHTML(image.url)}" data-gallery-alt="${escapeHTML(image.alt||product.name)}" aria-label="View photo ${index+1} of ${images.length}" aria-pressed="${image.url===mainImage.url}"><img src="${escapeHTML(image.url)}" alt="" loading="lazy"></button>`).join('')}</div>` : '';
+  $('#product-detail').innerHTML = `<div class="detail-gallery-main"><img class="detail-image" id="detail-main-image" src="${escapeHTML(mainImage.url)}" alt="${escapeHTML(mainImage.alt||product.name)}"></div>${gallery}<p class="product-category">${escapeHTML(product.category)}</p><h2>${escapeHTML(product.name)}</h2><p class="dialog-intro">${escapeHTML(product.description)}</p><p>${escapeHTML(product.unit)} · Standard ${money(product.price)}</p>${options}<button class="button button-dark full-width" data-add="${product.id}" ${variants.length ? 'data-select-variant="true"' : ''} ${!available ? 'disabled' : ''}>${!available ? 'Out of stock' : 'Add to basket'} ${icon('plus')}</button>`;
   $('#product-dialog').showModal();
 }
 document.addEventListener('click', event => {
   const target = event.target.closest('button');
   if (!target) return;
+  if (target.dataset.galleryImage) {
+    $('#detail-main-image').src = target.dataset.galleryImage;
+    $('#detail-main-image').alt = target.dataset.galleryAlt;
+    document.querySelectorAll('.detail-gallery-thumb').forEach(button => {
+      const active = button === target;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
   if (target.dataset.add) {
     const variant = target.dataset.selectVariant ? $('#detail-variant').value : '';
     add(variant ? `${target.dataset.add}:${variant}` : target.dataset.add);
@@ -230,7 +244,7 @@ $('#checkout-open').addEventListener('click', async () => {
   try {
     const bank = await request('/api/payment-settings');
     if (!bank) { $('#bank-details').textContent = 'Bank transfer is not configured. Please contact the store.'; return; }
-    $('#bank-details').textContent = `Bank: ${bank.bank_name}\nAccount name: ${bank.account_name}\nAccount number: ${bank.account_number}${bank.instructions ? `\n${bank.instructions}` : ''}`;
+    $('#bank-details').innerHTML = `<div class="checkout-bank-meta"><span>Bank</span><strong>${escapeHTML(bank.bank_name)}</strong></div><div class="checkout-bank-meta"><span>Account name</span><strong>${escapeHTML(bank.account_name)}</strong></div><div class="checkout-account-number"><span>ACCOUNT NUMBER</span><strong>${escapeHTML(bank.account_number)}</strong></div>${bank.instructions ? `<p>${escapeHTML(bank.instructions)}</p>` : ''}`;
     $('#place-order').disabled = false;
   } catch (error) {
     console.error(error);
@@ -272,13 +286,14 @@ $('#checkout-form').addEventListener('submit', async event => {
     });
     const order = await request('/api/orders', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: form.get('name'), phone: form.get('phone'), address: form.get('address'), notes: form.get('notes'), payment_proof: proof, ...(appliedCoupon?{coupon_code:appliedCoupon}:{}), expected_total: Object.entries(cart).reduce((total, [key, quantity]) => { const selection = cartItem(key); if (!selection) throw new Error('Remove unavailable items before checkout.'); return total + (selection.variant || selection.product).price * quantity; }, 0)-couponDiscount, items: Object.entries(cart).map(([key, quantity]) => { const [id, variant] = key.split(':').map(Number); return { product_id: id, ...(variant ? { variant_id: variant } : {}), quantity }; }) })
+      body: JSON.stringify({ name: form.get('name'), phone: form.get('phone'), address: form.get('address'), delivery_method: form.get('delivery_method'), notes: form.get('notes'), payment_proof: proof, ...(appliedCoupon?{coupon_code:appliedCoupon}:{}), expected_total: Object.entries(cart).reduce((total, [key, quantity]) => { const selection = cartItem(key); if (!selection) throw new Error('Remove unavailable items before checkout.'); return total + (selection.variant || selection.product).price * quantity; }, 0)-couponDiscount, items: Object.entries(cart).map(([key, quantity]) => { const [id, variant] = key.split(':').map(Number); return { product_id: id, ...(variant ? { variant_id: variant } : {}), quantity }; }) })
     });
     cart = {}; saveCart(); renderCart();
     appliedCoupon = ''; couponDiscount = 0;
     checkoutForm.reset();
     $('#checkout-dialog').close();
-    $('#success-message').textContent = `Your order #${order.id} has been placed. Subtotal: ${money(order.total)}. Your payment is awaiting verification.`;
+    const deliveryMessage = form.get('delivery_method') === 'boat' ? ' Boat delivery requested; the store will confirm availability and arrangements.' : '';
+    $('#success-message').textContent = `Your order #${order.id} has been placed. Subtotal: ${money(order.total)}. Your payment is awaiting verification.${deliveryMessage}`;
     $('#success-dialog').showModal();
     try { await loadProducts(); } catch (error) { console.error(error); toast('Order placed, but products could not be refreshed.'); }
   } catch (error) {

@@ -2,7 +2,7 @@ const $ = selector => document.querySelector(selector);
 const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 const money = amount => `MVR ${(amount / 100).toFixed(2)}`;
 const statuses = ['pending', 'confirmed', 'preparing', 'out for delivery', 'delivered', 'cancelled'];
-const state = { user: null, products: [], staff: [], orderOffset: 0, productOffset: 0, orderTotal: 0, productTotal: 0, orderRequest: 0, productRequest: 0 };
+const state = { user: null, products: [], staff: [], orderOffset: 0, productOffset: 0, orderTotal: 0, productTotal: 0, orderRequest: 0, productRequest: 0, productImages: [], pendingPhotos: [], pendingPrimaryIndex: null, pendingObjectUrls: [], galleryRequest: 0 };
 state.operationsModule = 'returns';
 const pageSize = 25;
 
@@ -34,8 +34,10 @@ function statusBadge(status) {
   return `<span class="status-badge status-${escapeHTML(status.replaceAll(' ', '-'))}">${escapeHTML(status)}</span>`;
 }
 function orderRow(order) {
-  const payment = order.payment_status && order.payment_status !== 'legacy' ? ` · Payment ${order.payment_status.replaceAll('_', ' ')}` : '';
-  return `<div class="order-row"><div class="order-number"><strong>#${order.id}</strong><small>${escapeHTML(dateTime(order.created_at))}</small></div><div class="order-customer"><strong>${escapeHTML(order.customer_name)}</strong><small>${order.phone ? escapeHTML(order.phone) : ''}${escapeHTML(payment)}</small></div>${statusBadge(order.status)}<strong class="row-total">${money(order.total)}</strong><button class="row-action" data-order="${order.id}">View →</button></div>`;
+  const payment = order.payment_status && order.payment_status !== 'legacy' ? `Payment ${order.payment_status.replaceAll('_', ' ')}` : '';
+  const delivery = order.delivery_method === 'boat' ? 'Boat delivery' : order.delivery_method === 'standard' ? 'Standard delivery' : '';
+  const summary = [order.phone, delivery, payment].filter(Boolean).join(' · ');
+  return `<div class="order-row"><div class="order-number"><strong>#${order.id}</strong><small>${escapeHTML(dateTime(order.created_at))}</small></div><div class="order-customer"><strong>${escapeHTML(order.customer_name)}</strong><small>${escapeHTML(summary)}</small></div>${statusBadge(order.status)}<strong class="row-total">${money(order.total)}</strong><button class="row-action" data-order="${order.id}">View →</button></div>`;
 }
 function activityChart(days) {
   const maximum = Math.max(1, ...days.map(day => day.count));
@@ -55,6 +57,9 @@ async function loadOverview() {
   $('#metric-delivered').textContent = data.delivered;
   $('#metric-subtotal').textContent = `${money(data.delivered_subtotal)} subtotal · not payments`;
   $('#metric-low').textContent = data.low_stock;
+  $('#toolbar-pending').textContent = data.pending;
+  $('#toolbar-low-stock').textContent = data.low_stock;
+  $('#toolbar-payment-pending').textContent = data.pending_payments;
   $('#metric-today').textContent = data.today_orders;
   $('#metric-catalog').textContent = data.catalog_products;
   $('#activity-total').textContent = data.activity.reduce((total, day) => total + day.count, 0);
@@ -70,7 +75,7 @@ function pagination(type, offset, total) {
 }
 async function loadOrders() {
   const sequence = ++state.orderRequest;
-  const params = new URLSearchParams({ q: $('#order-search').value.trim(), status: $('#order-status-filter').value, limit: String(pageSize), offset: String(state.orderOffset) });
+  const params = new URLSearchParams({ q: $('#order-search').value.trim(), status: $('#order-status-filter').value, payment_status: $('#order-payment-filter').value, limit: String(pageSize), offset: String(state.orderOffset) });
   const data = await request(`/api/admin/order-search?${params}`);
   if (sequence !== state.orderRequest) return;
   state.orderTotal = data.total;
@@ -119,7 +124,12 @@ async function switchPanel(panel, module = state.operationsModule) {
   if (panel === 'operations' && ['content','inbox'].includes(module) && state.user.role !== 'admin') return;
   if (panel === 'operations') state.operationsModule = module;
   document.querySelectorAll('.dashboard-panel').forEach(element => element.classList.add('hidden'));
-  document.querySelectorAll('[data-panel]').forEach(element => element.classList.toggle('active', element.dataset.panel === panel && (panel !== 'operations' || element.dataset.module === module)));
+  document.querySelectorAll('[data-panel]').forEach(element => {
+    const active = element.dataset.panel === panel && (panel !== 'operations' || element.dataset.module === module);
+    element.classList.toggle('active', active);
+    if (active) element.setAttribute('aria-current', 'page');
+    else element.removeAttribute('aria-current');
+  });
   $(`#${panel}-panel`).classList.remove('hidden');
   clearError($('#admin-error'));
   try {
@@ -161,12 +171,20 @@ $('#logout').addEventListener('click', async () => {
   catch (error) { report(error); }
 });
 document.querySelectorAll('[data-panel]').forEach(button => button.addEventListener('click', () => switchPanel(button.dataset.panel, button.dataset.module)));
+$('#global-search-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  state.orderOffset = 0;
+  $('#order-search').value = $('#global-search-input').value.trim();
+  $('#order-status-filter').value = '';
+  $('#order-payment-filter').value = '';
+  await switchPanel('orders');
+});
 document.addEventListener('click', async event => {
   const button = event.target.closest('button');
   if (!button) return;
   if (button.dataset.close) $(`#${button.dataset.close}`).close();
   if (button.dataset.go) {
-    if (button.dataset.go === 'orders') { state.orderOffset = 0; $('#order-search').value = ''; $('#order-status-filter').value = button.dataset.status || ''; }
+    if (button.dataset.go === 'orders') { state.orderOffset = 0; $('#order-search').value = ''; $('#order-status-filter').value = button.dataset.status || ''; $('#order-payment-filter').value = button.dataset.payment || ''; }
     if (button.dataset.go === 'products') { state.productOffset = 0; $('#product-search').value = ''; $('#product-category-filter').value = ''; $('#product-stock-filter').value = button.dataset.stock || ''; }
     await switchPanel(button.dataset.go);
   }
@@ -189,6 +207,7 @@ $('#refresh-products').addEventListener('click', () => loadProducts().catch(repo
 let orderTimer;
 $('#order-search').addEventListener('input', () => { state.orderOffset = 0; clearTimeout(orderTimer); orderTimer = setTimeout(() => loadOrders().catch(report), 250); });
 $('#order-status-filter').addEventListener('change', () => { state.orderOffset = 0; loadOrders().catch(report); });
+$('#order-payment-filter').addEventListener('change', () => { state.orderOffset = 0; loadOrders().catch(report); });
 let productTimer;
 $('#product-search').addEventListener('input', () => { state.productOffset = 0; clearTimeout(productTimer); productTimer = setTimeout(() => loadProducts().catch(report), 250); });
 ['#product-category-filter', '#product-stock-filter'].forEach(selector => $(selector).addEventListener('change', () => { state.productOffset = 0; loadProducts().catch(report); }));
@@ -200,7 +219,8 @@ $('#products-next').addEventListener('click', () => { if (state.productOffset + 
 async function openOrder(id) {
   const order = await request(`/api/admin/orders/${id}`);
   $('#order-title').textContent = `Order #${order.id}`;
-  $('#order-detail').innerHTML = `<div class="order-detail-block"><div class="detail-line"><span>Status</span>${statusBadge(order.status)}</div><div class="detail-line"><span>Placed</span><strong>${escapeHTML(dateTime(order.created_at))}</strong></div><div class="detail-line"><span>Customer</span><strong>${escapeHTML(order.customer_name)}</strong></div><div class="detail-line"><span>Phone</span><strong>${escapeHTML(order.phone)}</strong></div><div class="detail-line"><span>Address</span><strong>${escapeHTML(order.address)}</strong></div>${order.notes ? `<div class="detail-line"><span>Notes</span><strong>${escapeHTML(order.notes)}</strong></div>` : ''}</div><h3>Items</h3>${order.items.map(item => `<div class="detail-line"><span>${item.quantity} × ${escapeHTML(item.name)}</span><strong>${money(item.quantity * item.unit_price)}</strong></div>`).join('')}<div class="detail-line detail-total"><span>Order subtotal</span><strong>${money(order.total)}</strong></div><p class="fine-print">Delivery charges are not tracked here.</p><label class="detail-status">Update status<select id="order-status-update" ${order.status === 'cancelled' ? 'disabled' : ''}>${statuses.map(status => `<option value="${status}" ${status === order.status ? 'selected' : ''}>${status}</option>`).join('')}</select></label><p class="form-error hidden" id="order-error" role="alert"></p><h3>Status history</h3><div class="history-list">${order.history.map(item => `<div><strong>${escapeHTML(item.status)}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`;
+  const delivery = order.delivery_method === 'boat' ? 'Boat delivery requested' : 'Standard delivery';
+  $('#order-detail').innerHTML = `<div class="order-detail-block"><div class="detail-line"><span>Status</span>${statusBadge(order.status)}</div><div class="detail-line"><span>Placed</span><strong>${escapeHTML(dateTime(order.created_at))}</strong></div><div class="detail-line"><span>Customer</span><strong>${escapeHTML(order.customer_name)}</strong></div><div class="detail-line"><span>Phone</span><strong>${escapeHTML(order.phone)}</strong></div><div class="detail-line"><span>Address</span><strong>${escapeHTML(order.address)}</strong></div><div class="detail-line"><span>Delivery</span><strong>${escapeHTML(delivery)}</strong></div>${order.notes ? `<div class="detail-line"><span>Notes</span><strong>${escapeHTML(order.notes)}</strong></div>` : ''}</div><h3>Items</h3>${order.items.map(item => `<div class="detail-line"><span>${item.quantity} × ${escapeHTML(item.name)}</span><strong>${money(item.quantity * item.unit_price)}</strong></div>`).join('')}<div class="detail-line detail-total"><span>Order subtotal</span><strong>${money(order.total)}</strong></div><p class="fine-print">Delivery availability, schedule and charges must be confirmed by the store.</p><label class="detail-status">Update status<select id="order-status-update" ${order.status === 'cancelled' ? 'disabled' : ''}>${statuses.map(status => `<option value="${status}" ${status === order.status ? 'selected' : ''}>${status}</option>`).join('')}</select></label><p class="form-error hidden" id="order-error" role="alert"></p><h3>Status history</h3><div class="history-list">${order.history.map(item => `<div><strong>${escapeHTML(item.status)}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`;
   const select = $('#order-status-update');
   const payment = order.payment_status === 'legacy' ? 'Existing order — payment not tracked' : `Bank transfer · ${order.payment_status.replaceAll('_', ' ')}`;
   $('#order-detail').insertAdjacentHTML('beforeend', `<h3>Payment</h3><p>${escapeHTML(payment)}</p>${order.has_payment_proof ? `<a class="text-link" href="/api/admin/orders/${order.id}/payment-proof">Download payment slip</a>` : ''}${order.payment_status !== 'legacy' && order.status === 'pending' ? '<p class="fine-print">Check the bank account independently before verifying. Rejected orders retain stock until cancelled.</p><div class="dashboard-actions"><button class="filter-button" id="verify-payment">Verify payment</button><button class="filter-button" id="reject-payment">Reject slip</button></div><p class="form-error hidden" id="payment-error" role="alert"></p>' : ''}<div class="history-list">${order.payment_history.map(item => `<div><strong>${escapeHTML(item.status.replaceAll('_', ' '))}</strong><small>${escapeHTML(item.actor)} · ${escapeHTML(dateTime(item.created_at))}</small></div>`).join('')}</div>`);
@@ -246,29 +266,160 @@ async function openOrder(id) {
   });
   if (!$('#order-dialog').open) $('#order-dialog').showModal();
 }
+const maxProductPhotos = 8;
+const maxPhotoBytes = 4 * 1024 * 1024;
+const maxPhotoBatchBytes = 16 * 1024 * 1024;
+function renderProductPhotos() {
+  state.pendingObjectUrls.forEach(url => URL.revokeObjectURL(url));
+  state.pendingObjectUrls = [];
+  const cards = state.productImages.map(image => {
+    const primary = image.is_primary;
+    return `<article class="product-photo-card ${primary ? 'is-primary' : ''}"><img src="${escapeHTML(image.url)}" alt="${escapeHTML(image.alt || 'Product photo')}" loading="lazy">${primary ? '<span class="main-photo-badge">MAIN PHOTO</span>' : ''}<div class="product-photo-card-info"><strong>${escapeHTML(image.alt || 'Product photo')}</strong><div class="product-photo-card-actions"><button type="button" data-photo-action="primary" data-photo-id="${image.id}" ${primary ? 'disabled' : ''}>Make main</button><button type="button" data-photo-action="remove" data-photo-id="${image.id}" ${primary ? 'disabled' : ''}>Remove</button></div></div></article>`;
+  });
+  state.pendingPhotos.forEach((file, index) => {
+    const url = URL.createObjectURL(file);
+    state.pendingObjectUrls.push(url);
+    const primary = index === state.pendingPrimaryIndex;
+    cards.push(`<article class="product-photo-card ${primary ? 'is-primary' : ''}"><img src="${url}" alt="Preview of ${escapeHTML(file.name)}">${primary ? '<span class="pending-photo-badge">NEW MAIN</span>' : ''}<div class="product-photo-card-info"><strong>${escapeHTML(file.name)}</strong><div class="product-photo-card-actions"><button type="button" data-photo-action="pending-primary" data-photo-index="${index}" ${primary ? 'disabled' : ''}>Make main</button><button type="button" data-photo-action="pending-remove" data-photo-index="${index}">Remove</button></div></div></article>`);
+  });
+  $('#product-photo-cards').innerHTML = cards.join('') || '<div class="product-photo-empty">No photos yet. Add product photos or enter a main photo URL above.</div>';
+}
+function setPhotoMessage(message, isError = false) {
+  const element = $('#product-photo-message');
+  element.textContent = message;
+  element.classList.toggle('form-error', isError);
+}
+function readPhoto(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ data: reader.result, alt: file.name.replace(/\.[^.]+$/, '').slice(0, 200) });
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
+}
 function openProduct(product) {
   const form = $('#product-form');
   form.reset();
   clearError($('#product-error'));
+  state.galleryRequest++;
+  state.productImages = [];
+  state.pendingPhotos = [];
+  state.pendingPrimaryIndex = null;
+  setPhotoMessage('');
   $('#product-form-title').textContent = product ? 'Edit product' : 'Add product';
   for (const name of ['id', 'version', 'name', 'category', 'unit', 'stock', 'image', 'description']) form.elements[name].value = product?.[name] ?? '';
   form.elements.price.value = product ? (product.price / 100).toFixed(2) : '';
   form.elements.original_price.value = product?.original_price != null ? (product.original_price / 100).toFixed(2) : '';
   form.elements.featured.checked = Boolean(product?.featured);
+  renderProductPhotos();
   $('#product-form-dialog').showModal();
+  if (product) {
+    const requestId = state.galleryRequest;
+    request(`/api/admin/products/${product.id}/images`).then(gallery => {
+      if (requestId !== state.galleryRequest) return;
+      state.productImages = gallery.items;
+      form.elements.version.value = gallery.version;
+      const primary = gallery.items.find(image => image.is_primary);
+      if (primary) form.elements.image.value = primary.url;
+      renderProductPhotos();
+    }).catch(error => setPhotoMessage(error.message, true));
+  }
 }
 $('#add-product').addEventListener('click', () => openProduct());
+$('#product-photo-upload').addEventListener('change', event => {
+  const selected = [...event.currentTarget.files];
+  event.currentTarget.value = '';
+  const totalCount = state.productImages.length + state.pendingPhotos.length + selected.length;
+  if (totalCount > maxProductPhotos) return setPhotoMessage(`A product can have up to ${maxProductPhotos} photos total.`, true);
+  if (selected.some(file => !['image/jpeg', 'image/png', 'image/webp'].includes(file.type))) return setPhotoMessage('Choose JPEG, PNG, or WebP photos only.', true);
+  if (selected.some(file => file.size > maxPhotoBytes)) return setPhotoMessage('Each photo must be no larger than 4 MB.', true);
+  if (selected.reduce((sum, file) => sum + file.size, 0) + state.pendingPhotos.reduce((sum, file) => sum + file.size, 0) > maxPhotoBatchBytes) return setPhotoMessage('Photos in one upload cannot exceed 16 MB total.', true);
+  state.pendingPhotos.push(...selected);
+  if (!formImageValue() && state.pendingPrimaryIndex === null && state.productImages.length === 0 && state.pendingPhotos.length) state.pendingPrimaryIndex = 0;
+  setPhotoMessage(`${state.pendingPhotos.length} photo${state.pendingPhotos.length === 1 ? '' : 's'} ready to save.`);
+  renderProductPhotos();
+});
+function formImageValue() { return $('#product-form').elements.image.value.trim(); }
+$('#product-photo-cards').addEventListener('click', async event => {
+  const button = event.target.closest('button[data-photo-action]');
+  if (!button || button.disabled) return;
+  const action = button.dataset.photoAction;
+  if (action === 'pending-remove') {
+    const index = Number(button.dataset.photoIndex);
+    state.pendingPhotos.splice(index, 1);
+    if (state.pendingPrimaryIndex === index) state.pendingPrimaryIndex = null;
+    else if (state.pendingPrimaryIndex !== null && state.pendingPrimaryIndex > index) state.pendingPrimaryIndex--;
+    setPhotoMessage('');
+    renderProductPhotos();
+    return;
+  }
+  if (action === 'pending-primary') {
+    state.pendingPrimaryIndex = Number(button.dataset.photoIndex);
+    setPhotoMessage('Selected photo will become the main product photo when saved.');
+    renderProductPhotos();
+    return;
+  }
+  const id = $('#product-form').elements.id.value;
+  const photoId = Number(button.dataset.photoId);
+  const version = Number($('#product-form').elements.version.value);
+  button.disabled = true;
+  try {
+    let result;
+    if (action === 'primary') {
+      result = await post(`/api/admin/products/${id}/images/${photoId}/primary`, 'PUT', { version });
+      $('#product-form').elements.image.value = result.image;
+      state.productImages = state.productImages.map(image => ({ ...image, is_primary: image.id === photoId }));
+      $('#product-form').elements.version.value = result.version;
+    } else if (action === 'remove') {
+      result = await request(`/api/admin/products/${id}/images/${photoId}`, { method: 'DELETE' });
+      state.productImages = result.items;
+      $('#product-form').elements.version.value = result.version;
+    }
+    setPhotoMessage('');
+    renderProductPhotos();
+  } catch (error) {
+    setPhotoMessage(error.message, true);
+    button.disabled = false;
+  }
+});
 $('#product-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget;
   const data = new FormData(form);
   const id = data.get('id');
-  const input = { name: data.get('name'), category: data.get('category'), unit: data.get('unit'), stock: Number(data.get('stock')), price: Math.round(Number(data.get('price')) * 100), original_price: data.get('original_price') === '' ? null : Math.round(Number(data.get('original_price')) * 100), image: data.get('image'), description: data.get('description'), featured: form.elements.featured.checked, ...(id ? { version: Number(data.get('version')) } : {}) };
+  const input = { name: data.get('name'), category: data.get('category'), unit: data.get('unit'), stock: Number(data.get('stock')), price: Math.round(Number(data.get('price')) * 100), original_price: data.get('original_price') === '' ? null : Math.round(Number(data.get('original_price')) * 100), image: String(data.get('image') || '').trim(), description: data.get('description'), featured: form.elements.featured.checked, ...(id ? { version: Number(data.get('version')) } : {}) };
   const button = form.querySelector('button[type=submit]');
   button.disabled = true;
   clearError($('#product-error'));
   try {
-    await post(id ? `/api/admin/products/${id}` : '/api/admin/products', id ? 'PUT' : 'POST', input);
+    const pending = state.pendingPhotos.slice();
+    if (!input.image && !pending.length) throw new Error('Add a main photo URL or upload at least one product photo.');
+    if (!id) {
+      let uploadOrder = pending;
+      if (state.pendingPrimaryIndex !== null) uploadOrder = [pending[state.pendingPrimaryIndex], ...pending.filter((_, index) => index !== state.pendingPrimaryIndex)];
+      const photos = await Promise.all(uploadOrder.map(readPhoto));
+      await post('/api/admin/products', 'POST', { ...input, ...(photos.length ? { images: photos } : {}), ...(state.pendingPrimaryIndex === null ? {} : { image: '' }) });
+    } else {
+      let version = Number(form.elements.version.value);
+      if (pending.length) {
+        const primaryIndex = state.pendingPrimaryIndex;
+        const uploadOrder = primaryIndex === null ? pending : [pending[primaryIndex], ...pending.filter((_, index) => index !== primaryIndex)];
+        const photos = await Promise.all(uploadOrder.map(readPhoto));
+        const gallery = await post(`/api/admin/products/${id}/images`, 'POST', { images: photos, ...(primaryIndex === null ? {} : { primaryIndex: 0 }) });
+        state.productImages = gallery.items;
+        version = gallery.version;
+        form.elements.version.value = version;
+        state.pendingPhotos = [];
+        state.pendingPrimaryIndex = null;
+        const primary = gallery.items.find(image => image.is_primary);
+        if (primary) form.elements.image.value = primary.url;
+        renderProductPhotos();
+        setPhotoMessage('Photos uploaded.');
+      }
+      input.image = form.elements.image.value.trim();
+      input.version = version;
+      await post(`/api/admin/products/${id}`, 'PUT', input);
+    }
     $('#product-form-dialog').close();
     try { await Promise.all([loadProducts(), loadOverview()]); } catch (error) { report(error); }
   } catch (error) { showError($('#product-error'), error); }
