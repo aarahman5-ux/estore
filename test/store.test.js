@@ -214,8 +214,8 @@ test('a version 1 database upgrades to version 2 without recreating staff', () =
     assert.equal(existing.prepare('SELECT COUNT(*) AS count FROM staff_users').get().count, 1);
   } finally { existing.close(); }
 });
-test('version 2 and 3 databases upgrade without losing products or orders', () => {
-  for (const version of [2, 3]) {
+test('version 2, 3, and 4 databases upgrade without losing store data', () => {
+  for (const version of [2, 3, 4]) {
     const existing = new DatabaseSync(':memory:');
     try {
       existing.exec(`PRAGMA foreign_keys=ON;
@@ -227,20 +227,27 @@ test('version 2 and 3 databases upgrade without losing products or orders', () =
         INSERT INTO order_items VALUES (1, 12, 1);
         CREATE TABLE staff_users (id INTEGER PRIMARY KEY);
         INSERT INTO staff_users VALUES (1);`);
-      if (version === 3) existing.exec(`
+      if (version >= 3) existing.exec(`
         CREATE TABLE product_variants (id INTEGER PRIMARY KEY, product_id INTEGER REFERENCES products(id), name TEXT, price INTEGER, stock INTEGER, version INTEGER);
         INSERT INTO product_variants VALUES (5, 1, 'Blue', 100, 4, 0);
         ALTER TABLE order_items ADD COLUMN variant_id INTEGER REFERENCES product_variants(id);
         UPDATE order_items SET variant_id=5;
         CREATE TABLE order_shipments (order_id INTEGER PRIMARY KEY REFERENCES orders(id));
       `);
+      if (version >= 4) existing.exec(`
+        ALTER TABLE orders ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'legacy';
+        CREATE TABLE bank_settings (id INTEGER PRIMARY KEY, bank_name TEXT, account_name TEXT, account_number TEXT, instructions TEXT);
+        CREATE TABLE payment_proofs (order_id INTEGER PRIMARY KEY, file_type TEXT, content BLOB);
+        CREATE TABLE payment_history (id INTEGER PRIMARY KEY, order_id INTEGER, status TEXT, actor TEXT, created_at TEXT);
+      `);
       existing.exec(`PRAGMA user_version=${version}`);
       migrate(existing, '');
       assert.equal(existing.prepare('PRAGMA user_version').get().user_version, 7);
       assert.equal(existing.prepare('SELECT version FROM products WHERE id=1').get().version, 7);
       assert.equal(existing.prepare('SELECT payment_status FROM orders WHERE id=12').get().payment_status, 'legacy');
-      assert.equal(existing.prepare('SELECT variant_id FROM order_items WHERE id=1').get().variant_id, version === 3 ? 5 : null);
+      assert.equal(existing.prepare('SELECT variant_id FROM order_items WHERE id=1').get().variant_id, version >= 3 ? 5 : null);
       assert.equal(existing.prepare('SELECT COUNT(*) AS count FROM bank_settings').get().count, 0);
+      assert.equal(existing.prepare('SELECT COUNT(*) AS count FROM store_settings').get().count, 1);
       migrate(existing, '');
     } finally { existing.close(); }
   }
